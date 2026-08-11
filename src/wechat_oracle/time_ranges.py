@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 DEFAULT_TZ = ZoneInfo("Asia/Hong_Kong")
@@ -15,6 +16,57 @@ class TimeRange:
     end_t: int
     label: str
     remaining_text: str
+
+
+SummaryKind = Literal["hourly", "daily"]
+
+
+@dataclass(frozen=True)
+class SummaryPeriod:
+    kind: SummaryKind
+    start_t: int
+    end_t: int
+    label: str
+
+
+def latest_mature_summary_periods(
+    *,
+    now: datetime | None = None,
+    tz: ZoneInfo = DEFAULT_TZ,
+    grace_seconds: int = 300,
+    hourly: bool = False,
+    daily: bool = False,
+) -> tuple[SummaryPeriod, ...]:
+    """Return the latest completed periods after the ingest grace window.
+
+    Hour windows are absolute 3600-second ranges so DST gaps/folds cannot
+    create zero- or two-hour jobs. Day windows use adjacent local midnights.
+    """
+    if grace_seconds < 0:
+        raise ValueError("grace_seconds must be non-negative")
+    current = _as_local(now, tz)
+    cutoff = datetime.fromtimestamp(current.timestamp() - grace_seconds, tz)
+    periods: list[SummaryPeriod] = []
+    if hourly:
+        hour_end = cutoff.replace(minute=0, second=0, microsecond=0)
+        end_t = int(hour_end.timestamp())
+        start_t = end_t - 3600
+        start = datetime.fromtimestamp(start_t, tz)
+        end = datetime.fromtimestamp(end_t, tz)
+        label = f"{start:%Y-%m-%d %H:%M%z} - {end:%H:%M%z}"
+        periods.append(SummaryPeriod("hourly", start_t, end_t, label))
+    if daily:
+        day_end = datetime.combine(cutoff.date(), time.min, tzinfo=tz)
+        day_start = datetime.combine(cutoff.date() - timedelta(days=1), time.min, tzinfo=tz)
+        periods.append(
+            SummaryPeriod(
+                "daily",
+                int(day_start.timestamp()),
+                int(day_end.timestamp()),
+                f"{day_start:%Y-%m-%d}",
+            )
+        )
+    return tuple(periods)
 
 
 def parse_natural_time_range(
@@ -75,15 +127,18 @@ def parse_natural_time_range(
 def previous_natural_day(
     *, now: datetime | None = None, tz: ZoneInfo = DEFAULT_TZ
 ) -> TimeRange:
-    if now is None:
-        current = datetime.now(tz)
-    elif now.tzinfo is None:
-        current = now.replace(tzinfo=tz)
-    else:
-        current = now.astimezone(tz)
-    end = current.replace(hour=0, minute=0, second=0, microsecond=0)
-    start = end - timedelta(days=1)
+    current = _as_local(now, tz)
+    end = datetime.combine(current.date(), time.min, tzinfo=tz)
+    start = datetime.combine(current.date() - timedelta(days=1), time.min, tzinfo=tz)
     return TimeRange(int(start.timestamp()), int(end.timestamp()), f"{start:%Y-%m-%d}", "")
+
+
+def _as_local(now: datetime | None, tz: ZoneInfo) -> datetime:
+    if now is None:
+        return datetime.now(tz)
+    if now.tzinfo is None:
+        return now.replace(tzinfo=tz)
+    return now.astimezone(tz)
 
 
 def _local_date(year: str, month: str, day: str, tz: ZoneInfo) -> datetime:

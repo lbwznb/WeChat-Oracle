@@ -1,10 +1,17 @@
 from datetime import datetime
 from pathlib import Path
+import time
 from zoneinfo import ZoneInfo
 
 from wechat_oracle.config import settings
-from wechat_oracle.daily_summary import run_daily_group, split_message
+from wechat_oracle.daily_summary import (
+    recover_pending_deliveries,
+    run_daily_group,
+    run_summary_group,
+    split_message,
+)
 from wechat_oracle.db import get_conn, init_db
+from wechat_oracle.time_ranges import SummaryPeriod
 
 
 TZ = ZoneInfo("Asia/Hong_Kong")
@@ -86,6 +93,7 @@ def test_daily_summary_is_idempotent(tmp_path: Path, monkeypatch) -> None:
         assert conn.execute("SELECT status FROM summary_runs").fetchone()[0] == "sent"
         assert conn.execute("SELECT COUNT(*) FROM delivery_outbox").fetchone()[0] == 1
     assert len(replier.sent) == 1
+    assert replier.sent[0][2].startswith("#过去一天话题")
 
 
 def test_ambiguous_send_is_not_retryable(tmp_path: Path, monkeypatch) -> None:
@@ -212,8 +220,39 @@ def test_unknown_outbox_is_never_retried(tmp_path: Path) -> None:
     assert replier.sent == []
 
 
-def test_existing_running_and_terminal_runs_are_noops(tmp_path: Path) -> None:
-    for status in ("running", "sent", "skipped", "failed", "unknown"):
+def test_recovery_does_not_send_after_raw_authorization_is_revoked(
+    tmp_path: Path, monkeypatch
+) -> None:
+    db_path = tmp_path / "revoked.db"
+    init_db(db_path)
+    monkeypatch.setattr(settings, "groups", ["g1"])
+    monkeypatch.setattr(settings, "reply_allowed_groups", ["group one"])
+    monkeypatch.setattr(settings, "raw_wechat_enabled", True)
+    monkeypatch.setattr(settings, "raw_wechat_account", "0123456789ab")
+    replier = FakeReplier()
+    with get_conn(db_path) as conn:
+        run_id = _insert_run(conn, "ready", "stored summary")
+        conn.execute(
+            "INSERT INTO delivery_outbox (summary_run_id, status, created_at, updated_at) "
+            "VALUES (?, 'pending', 1, 1)",
+            (run_id,),
+        )
+        conn.execute(
+            """
+            INSERT INTO raw_group_authorizations
+                (account_fingerprint, canonical_group_id, display_name,
+                 contact_generation, enabled, created_at, updated_at)
+            VALUES (?, 'g1', 'group one', 'v1', 0, 1, 1)
+            """,
+            (settings.raw_wechat_account,),
+        )
+        assert recover_pending_deliveries(conn, replier=replier, sleep=lambda _: None) == 0
+        assert replier.sent == []
+        assert conn.execute("SELECT status FROM delivery_outbox").fetchone()[0] == "pending"
+
+
+def test_terminal_runs_are_noops(tmp_path: Path) -> None:
+    for status in ("sent", "skipped", "failed", "unknown"):
         db_path = tmp_path / f"{status}.db"
         init_db(db_path)
         replier = FakeReplier()
@@ -227,7 +266,40 @@ def test_existing_running_and_terminal_runs_are_noops(tmp_path: Path) -> None:
         assert replier.sent == []
 
 
-def test_concurrent_unknown_demotion_is_not_overwritten_by_sender(tmp_path: Path) -> None:
+def test_stale_running_generation_is_recovered(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "stale.db"
+    init_db(db_path)
+    monkeypatch.setattr(settings, "daily_summary_min_messages", 5)
+    replier = FakeReplier()
+    with get_conn(db_path) as conn:
+        _seed(conn)
+        _insert_run(conn, "running")
+        assert run_daily_group(
+            conn, group_id="g1", group_name="group one", replier=replier,
+            llm=FakeLLM(), now=NOW, sleep=lambda _: None,
+        ) == "sent"
+        row = conn.execute(
+            "SELECT status, generation_attempt_count FROM summary_runs"
+        ).fetchone()
+        assert tuple(row) == ("sent", 2)
+
+
+def test_fresh_running_generation_is_not_stolen(tmp_path: Path) -> None:
+    db_path = tmp_path / "fresh.db"
+    init_db(db_path)
+    with get_conn(db_path) as conn:
+        run_id = _insert_run(conn, "running")
+        conn.execute(
+            "UPDATE summary_runs SET lease_token='owner', lease_until=? WHERE run_id=?",
+            (time.time() + 300, run_id),
+        )
+        assert run_daily_group(
+            conn, group_id="g1", group_name="group one", replier=FakeReplier(),
+            llm=ExplodingLLM(), now=NOW, sleep=lambda _: None,
+        ) == "duplicate"
+
+
+def test_fresh_concurrent_sender_is_left_in_progress(tmp_path: Path) -> None:
     db_path = tmp_path / "test.db"
     init_db(db_path)
     with get_conn(db_path) as seed_conn:
@@ -240,20 +312,46 @@ def test_concurrent_unknown_demotion_is_not_overwritten_by_sender(tmp_path: Path
                 assert run_daily_group(
                     other, group_id="g1", group_name="group one", replier=FakeReplier(),
                     llm=ExplodingLLM(), now=NOW, sleep=lambda _: None,
-                ) == "unknown"
+                ) == "in_progress"
 
     replier = ConcurrentReplier()
     with get_conn(db_path) as conn:
         assert run_daily_group(
             conn, group_id="g1", group_name="group one", replier=replier,
             llm=FakeLLM(), now=NOW, sleep=lambda _: None,
-        ) == "unknown"
+        ) == "sent"
         statuses = conn.execute(
             "SELECT summary_runs.status, delivery_outbox.status "
             "FROM summary_runs JOIN delivery_outbox ON delivery_outbox.summary_run_id=summary_runs.run_id"
         ).fetchone()
-        assert tuple(statuses) == ("unknown", "unknown")
+        assert tuple(statuses) == ("sent", "sent")
     assert len(replier.sent) == 1
+
+
+def test_hourly_summary_uses_requested_period_and_header(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "hourly.db"
+    init_db(db_path)
+    monkeypatch.setattr(settings, "bot_name", "assistant")
+    period = SummaryPeriod(
+        "hourly",
+        int(datetime(2026, 8, 10, 9, 0, tzinfo=TZ).timestamp()),
+        int(datetime(2026, 8, 10, 10, 0, tzinfo=TZ).timestamp()),
+        "2026-08-10 09:00+0800 - 10:00+0800",
+    )
+    replier = FakeReplier()
+    with get_conn(db_path) as conn:
+        _seed(conn)
+        assert run_summary_group(
+            conn,
+            group_id="g1",
+            group_name="group one",
+            period=period,
+            min_messages=5,
+            replier=replier,
+            llm=FakeLLM(),
+            sleep=lambda _: None,
+        ) == "sent"
+    assert replier.sent[0][2].startswith("#过去一小时话题")
 
 
 def test_split_message_hard_cap() -> None:

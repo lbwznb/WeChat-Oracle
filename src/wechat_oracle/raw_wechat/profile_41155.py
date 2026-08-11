@@ -1,4 +1,4 @@
-"""Exact, hash-bound metadata for the signed Weixin 4.1.11.55 build."""
+"""Hash-bound profile for the reviewed signed Weixin 4.1.11.55 build."""
 from __future__ import annotations
 
 import hashlib

@@ -1077,9 +1077,11 @@ def fetch_candidates(
           LEFT JOIN messages orig
                  ON orig.wx_msg_id = m.reply_to_wx_msg_id
                 AND orig.group_id  = m.group_id
-         WHERE m.group_id = ?
+         WHERE (m.group_id = ? OR m.group_id IN (
+                   SELECT alias_id FROM group_aliases WHERE canonical_group_id = ?
+               ))
     """
-    main_params: list[object] = [group_id]
+    main_params: list[object] = [group_id, group_id]
     if target is not None:
         main_sql += " AND (m.sender_display = ? OR m.sender_wxid = ?)"
         main_params.extend([target, target])
@@ -1111,10 +1113,12 @@ def fetch_candidates(
                f.content AS fwd_content
           FROM forwarded_records f
           JOIN messages m ON m.msg_id = f.parent_msg_id
-         WHERE m.group_id = ?
+         WHERE (m.group_id = ? OR m.group_id IN (
+                   SELECT alias_id FROM group_aliases WHERE canonical_group_id = ?
+               ))
            AND f.content IS NOT NULL AND f.content <> ''
     """
-    fwd_params: list[object] = [group_id]
+    fwd_params: list[object] = [group_id, group_id]
     if target is not None:
         fwd_sql += " AND f.sender_display = ?"
         fwd_params.append(target)
@@ -3091,12 +3095,18 @@ def run_dispatcher() -> None:
             if settings.agent_lurk_enabled else None
         )
         next_lurk_check = time.time() + max(1, settings.agent_lurk_interval_seconds)
-        daily_scheduler = None
-        next_daily_check = 0.0
-        if settings.daily_summary_enabled:
-            from .daily_summary import DailySummaryScheduler
-            daily_scheduler = DailySummaryScheduler(replier=replier, llm_factory=_build_llm_client)
-            logger.info("daily summary enabled: previous natural day, timezone=Asia/Hong_Kong")
+        summary_scheduler = None
+        next_summary_check = 0.0
+        if settings.hourly_summary_enabled or settings.daily_summary_enabled:
+            from .daily_summary import SummaryScheduler
+            summary_scheduler = SummaryScheduler(replier=replier, llm_factory=_build_llm_client)
+            logger.info(
+                "automatic summaries enabled: hourly={} daily={} timezone={} grace={}s",
+                settings.hourly_summary_enabled,
+                settings.daily_summary_enabled,
+                settings.summary_timezone,
+                settings.summary_sync_grace_seconds,
+            )
         if lurk_scheduler is not None:
             logger.info(
                 "lurk scheduler enabled: interval={}s min_new={} batch={}",
@@ -3106,9 +3116,9 @@ def run_dispatcher() -> None:
             )
         try:
             while True:
-                if daily_scheduler is not None and time.time() >= next_daily_check:
-                    daily_scheduler.maybe_submit()
-                    next_daily_check = time.time() + 60
+                if summary_scheduler is not None and time.time() >= next_summary_check:
+                    summary_scheduler.maybe_submit()
+                    next_summary_check = time.time() + 30
                 rows = _next_unprocessed(
                     conn,
                     settings.bot_name,
@@ -3159,8 +3169,8 @@ def run_dispatcher() -> None:
         except KeyboardInterrupt:
             logger.info("dispatcher stopped by user")
         finally:
-            if daily_scheduler is not None:
-                daily_scheduler.close()
+            if summary_scheduler is not None:
+                summary_scheduler.close()
             scheduler.close()
             if lurk_scheduler is not None:
                 lurk_scheduler.close()

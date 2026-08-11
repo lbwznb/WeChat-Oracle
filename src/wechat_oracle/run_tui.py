@@ -240,15 +240,16 @@ class ConfigValueScreen(ModalScreen[str | None]):
         ("escape", "cancel", "取消"),
     ]
 
-    def __init__(self, *, title: str, value: str) -> None:
+    def __init__(self, *, title: str, value: str, password: bool = False) -> None:
         super().__init__()
         self._title = title
         self._value = value
+        self._password = password
 
     def compose(self) -> ComposeResult:
         with Vertical(id="config-value-editor"):
             yield Static(self._title, id="config-value-title")
-            yield Input(value=self._value, id="config-value-input")
+            yield Input(value=self._value, password=self._password, id="config-value-input")
             with Horizontal(id="config-value-buttons"):
                 yield Button("确定", id="config-value-save", variant="primary")
                 yield Button("取消", id="config-value-cancel")
@@ -273,6 +274,76 @@ class ConfigValueScreen(ModalScreen[str | None]):
 
     def _save(self) -> None:
         self.dismiss(self.query_one("#config-value-input", Input).value.strip())
+
+
+class ConfigGroupSelectionScreen(ModalScreen[tuple[str, ...] | None]):
+    """Select exact canonical groups from the local authorization table."""
+
+    BINDINGS = [("escape", "cancel", "取消")]
+
+    def __init__(
+        self,
+        options: tuple[tuple[str, str], ...],
+        selected: tuple[str, ...],
+    ) -> None:
+        super().__init__()
+        self._options = options
+        self._selected = set(selected)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="config-value-editor"):
+            yield Static("选择自动归档与总结的群", id="config-value-title")
+            if not self._options:
+                yield Static(
+                    "还没有已授权群。先运行 WeChatOracle.exe raw groups，"
+                    "再用 raw authorize <canonical-id> 授权。",
+                    id="config-value-help",
+                )
+            for index, (group_id, name) in enumerate(self._options):
+                marker = "☑" if group_id in self._selected else "☐"
+                yield Button(
+                    f"{marker} {name}  {_clip(group_id, 32)}",
+                    id=f"config-group-{index}",
+                    classes="config-menu-item",
+                    compact=True,
+                )
+            with Horizontal(id="config-value-buttons"):
+                yield Button("确定", id="config-groups-save", variant="primary")
+                yield Button("取消", id="config-groups-cancel")
+
+    def on_mount(self) -> None:
+        controls = self._controls()
+        if controls:
+            controls[0].focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        button_id = event.button.id or ""
+        if button_id.startswith("config-group-"):
+            index = int(button_id.removeprefix("config-group-"))
+            group_id, name = self._options[index]
+            if group_id in self._selected:
+                self._selected.remove(group_id)
+                marker = "☐"
+            else:
+                self._selected.add(group_id)
+                marker = "☑"
+            event.button.label = f"{marker} {name}  {_clip(group_id, 32)}"
+        elif button_id == "config-groups-save":
+            ordered = tuple(group_id for group_id, _ in self._options if group_id in self._selected)
+            self.dismiss(ordered)
+        elif button_id == "config-groups-cancel":
+            self.action_cancel()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def _controls(self) -> list[Button]:
+        return [
+            *[self.query_one(f"#config-group-{index}", Button) for index in range(len(self._options))],
+            self.query_one("#config-groups-save", Button),
+            self.query_one("#config-groups-cancel", Button),
+        ]
 
 
 class ConfigBackendScreen(ModalScreen[str | None]):
@@ -555,7 +626,7 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
     def __init__(self, config: AgentRuntimeConfig) -> None:
         super().__init__()
         self._config = config
-        self._backend = config.backend if config.backend in {"native", "openclaw", "pi"} else "native"
+        self._backend = "native"
         self._proactive_mode = (
             config.proactive_mode
             if config.proactive_mode in {"off", "reactive", "proactive"}
@@ -572,23 +643,32 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
         self._continuation_delay_seconds = int(config.continuation_delay_seconds)
         self._continuation_ttl_seconds = int(config.continuation_ttl_seconds)
         self._llm_model = config.llm_model
+        self._llm_endpoint = config.llm_endpoint
+        self._llm_api_key_update: str | None = None
+        self._groups = tuple(config.groups)
+        self._raw_wechat_enabled = bool(config.raw_wechat_enabled)
+        self._raw_wechat_account = config.raw_wechat_account
+        self._hourly_summary_enabled = bool(config.hourly_summary_enabled)
+        self._daily_summary_enabled = bool(config.daily_summary_enabled)
         self._openclaw_agent_id = config.openclaw_agent_id
 
     def compose(self) -> ComposeResult:
         native_state = "已配置" if self._config.native_configured else "缺少 WO_LLM_API_KEY"
-        openclaw_state = (
-            "已配置"
-            if self._config.openclaw_configured
-            else "缺少 WO_OPENCLAW_TOKEN 或 WO_OPENCLAW_AGENT_ID"
-        )
         with Vertical(id="config-editor"):
             yield Static("运行配置", id="config-editor-title")
             yield Static(
-                f"Native：{native_state}　OpenClaw：{openclaw_state}　Pi：{'已配置' if self._config.pi_configured else '找不到 CLI'}",
+                f"SQLite 本地记忆库 + OpenAI 兼容 API：{native_state}",
                 id="config-editor-meta",
             )
             yield Static("改完后需要保存才会写入 .env，并重启调度进程。", id="config-editor-save-hint")
-            yield Button("", id="config-menu-backend", classes="config-menu-item", compact=True)
+            yield Button("", id="config-menu-api-endpoint", classes="config-menu-item", compact=True)
+            yield Button("", id="config-menu-api-key", classes="config-menu-item", compact=True)
+            yield Button("", id="config-menu-native-model", classes="config-menu-item", compact=True)
+            yield Button("", id="config-menu-groups", classes="config-menu-item", compact=True)
+            yield Button("", id="config-menu-raw-enabled", classes="config-menu-item", compact=True)
+            yield Button("", id="config-menu-raw-account", classes="config-menu-item", compact=True)
+            yield Button("", id="config-menu-hourly-summary", classes="config-menu-item", compact=True)
+            yield Button("", id="config-menu-daily-summary", classes="config-menu-item", compact=True)
             yield Button("", id="config-menu-proactive-mode", classes="config-menu-item", compact=True)
             yield Button("", id="config-menu-probability", classes="config-menu-item", compact=True)
             yield Button("", id="config-menu-mention-policy", classes="config-menu-item", compact=True)
@@ -596,8 +676,6 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
             yield Button("", id="config-menu-continuation-max", classes="config-menu-item", compact=True)
             yield Button("", id="config-menu-continuation-delay", classes="config-menu-item", compact=True)
             yield Button("", id="config-menu-continuation-ttl", classes="config-menu-item", compact=True)
-            yield Button("", id="config-menu-native-model", classes="config-menu-item", compact=True)
-            yield Button("", id="config-menu-openclaw-agent", classes="config-menu-item", compact=True)
             yield Button(
                 "保存到 .env，并重启调度进程",
                 id="config-menu-save",
@@ -613,7 +691,7 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
 
     def on_mount(self) -> None:
         self._refresh_menu()
-        self.query_one("#config-menu-backend", Button).focus()
+        self.query_one("#config-menu-api-endpoint", Button).focus()
 
     def on_key(self, event) -> None:  # type: ignore[no-untyped-def]
         if event.key == "down":
@@ -626,11 +704,43 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         event.stop()
         match event.button.id:
-            case "config-menu-backend":
+            case "config-menu-api-endpoint":
                 self.app.push_screen(
-                    ConfigBackendScreen(self._config, self._backend),
-                    self._on_backend_changed,
+                    ConfigValueScreen(title="OpenAI 兼容 API 地址", value=self._llm_endpoint),
+                    self._on_llm_endpoint_changed,
                 )
+            case "config-menu-api-key":
+                self.app.push_screen(
+                    ConfigValueScreen(title="API Key（留空则保留当前值）", value="", password=True),
+                    self._on_llm_api_key_changed,
+                )
+            case "config-menu-native-model":
+                self.app.push_screen(
+                    ConfigValueScreen(title="模型名称", value=self._llm_model),
+                    self._on_llm_model_changed,
+                )
+            case "config-menu-groups":
+                self.app.push_screen(
+                    ConfigGroupSelectionScreen(self._config.available_groups, self._groups),
+                    self._on_groups_changed,
+                )
+            case "config-menu-raw-enabled":
+                self._raw_wechat_enabled = not self._raw_wechat_enabled
+                self._refresh_menu()
+                self._mark_dirty()
+            case "config-menu-raw-account":
+                self.app.push_screen(
+                    ConfigValueScreen(title="微信账号匿名指纹", value=self._raw_wechat_account),
+                    self._on_raw_account_changed,
+                )
+            case "config-menu-hourly-summary":
+                self._hourly_summary_enabled = not self._hourly_summary_enabled
+                self._refresh_menu()
+                self._mark_dirty()
+            case "config-menu-daily-summary":
+                self._daily_summary_enabled = not self._daily_summary_enabled
+                self._refresh_menu()
+                self._mark_dirty()
             case "config-menu-proactive-mode":
                 self.app.push_screen(
                     ConfigProactiveModeScreen(self._proactive_mode),
@@ -677,16 +787,6 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
                     ),
                     self._on_continuation_ttl_changed,
                 )
-            case "config-menu-native-model":
-                self.app.push_screen(
-                    ConfigValueScreen(title="Native 模型", value=self._llm_model),
-                    self._on_llm_model_changed,
-                )
-            case "config-menu-openclaw-agent":
-                self.app.push_screen(
-                    ConfigValueScreen(title="OpenClaw Agent ID", value=self._openclaw_agent_id),
-                    self._on_openclaw_agent_changed,
-                )
             case "config-menu-save":
                 self.action_save()
             case "config-menu-cancel":
@@ -694,18 +794,27 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
 
     def action_save(self) -> None:
         llm_model = self._llm_model.strip()
+        llm_endpoint = self._llm_endpoint.strip()
         openclaw_agent = self._openclaw_agent_id.strip()
         if not llm_model:
             self.query_one("#config-editor-help", Static).update("Native 模型不能为空")
             return
-        if not openclaw_agent:
+        if self._backend == "openclaw" and not openclaw_agent:
             self.query_one("#config-editor-help", Static).update("OpenClaw Agent ID 不能为空")
             return
-        if self._backend == "native" and not self._config.native_configured:
+        if not llm_endpoint:
+            self.query_one("#config-editor-help", Static).update("API 地址不能为空")
+            return
+        if self._backend == "native" and not (
+            self._config.native_configured or self._llm_api_key_update
+        ):
             self.query_one("#config-editor-help", Static).update("Native 缺少 WO_LLM_API_KEY，不能切换")
             return
-        if self._backend == "openclaw" and not self._config.openclaw_token_configured:
-            self.query_one("#config-editor-help", Static).update("OpenClaw 缺少 WO_OPENCLAW_TOKEN，不能切换")
+        if self._raw_wechat_enabled and not self._raw_wechat_account:
+            self.query_one("#config-editor-help", Static).update("启用本地聊天库前请先选择账号指纹")
+            return
+        if (self._hourly_summary_enabled or self._daily_summary_enabled) and not self._groups:
+            self.query_one("#config-editor-help", Static).update("启用自动总结前至少选择一个已授权群")
             return
         if self._continuation_ttl_seconds < self._continuation_delay_seconds:
             self.query_one("#config-editor-help", Static).update("Continuation TTL must be >= delay")
@@ -725,6 +834,15 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
                 native_configured=self._config.native_configured,
                 openclaw_token_configured=self._config.openclaw_token_configured,
                 openclaw_configured=self._config.openclaw_configured,
+                pi_configured=self._config.pi_configured,
+                llm_endpoint=llm_endpoint,
+                llm_api_key_update=self._llm_api_key_update,
+                groups=self._groups,
+                available_groups=self._config.available_groups,
+                raw_wechat_enabled=self._raw_wechat_enabled,
+                raw_wechat_account=self._raw_wechat_account,
+                hourly_summary_enabled=self._hourly_summary_enabled,
+                daily_summary_enabled=self._daily_summary_enabled,
             )
         )
 
@@ -797,6 +915,30 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
             self._refresh_menu()
             self._mark_dirty()
 
+    def _on_llm_endpoint_changed(self, value: str | None) -> None:
+        if value is not None:
+            self._llm_endpoint = value
+            self._refresh_menu()
+            self._mark_dirty()
+
+    def _on_llm_api_key_changed(self, value: str | None) -> None:
+        if value:
+            self._llm_api_key_update = value
+            self._refresh_menu()
+            self._mark_dirty()
+
+    def _on_groups_changed(self, value: tuple[str, ...] | None) -> None:
+        if value is not None:
+            self._groups = value
+            self._refresh_menu()
+            self._mark_dirty()
+
+    def _on_raw_account_changed(self, value: str | None) -> None:
+        if value is not None:
+            self._raw_wechat_account = value.strip().lower()
+            self._refresh_menu()
+            self._mark_dirty()
+
     def _on_openclaw_agent_changed(self, value: str | None) -> None:
         if value is not None:
             self._openclaw_agent_id = value
@@ -804,8 +946,30 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
             self._mark_dirty()
 
     def _refresh_menu(self) -> None:
-        self.query_one("#config-menu-backend", Button).label = (
-            f"Agent 后端　{_backend_label(self._backend)}"
+        self.query_one("#config-menu-api-endpoint", Button).label = (
+            f"模型 API　{_clip(self._llm_endpoint, 52)}"
+        )
+        key_state = "本次将更新" if self._llm_api_key_update else (
+            "已配置" if self._config.native_configured else "未配置"
+        )
+        self.query_one("#config-menu-api-key", Button).label = f"API Key　{key_state}"
+        self.query_one("#config-menu-native-model", Button).label = (
+            f"模型　{_clip(self._llm_model, 52)}"
+        )
+        self.query_one("#config-menu-groups", Button).label = (
+            f"已选群　{len(self._groups)}/{len(self._config.available_groups)}"
+        )
+        self.query_one("#config-menu-raw-enabled", Button).label = (
+            f"本地聊天库　{'on' if self._raw_wechat_enabled else 'off'}"
+        )
+        self.query_one("#config-menu-raw-account", Button).label = (
+            f"微信账号　{self._raw_wechat_account or '未选择'}"
+        )
+        self.query_one("#config-menu-hourly-summary", Button).label = (
+            f"每小时总结　{'on' if self._hourly_summary_enabled else 'off'}"
+        )
+        self.query_one("#config-menu-daily-summary", Button).label = (
+            f"午夜每日总结　{'on' if self._daily_summary_enabled else 'off'}"
         )
         self.query_one("#config-menu-proactive-mode", Button).label = (
             f"主动模式　{_proactive_mode_label(self._proactive_mode)}"
@@ -828,12 +992,6 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
         self.query_one("#config-menu-continuation-ttl", Button).label = (
             f"Follow-up TTL：{self._continuation_ttl_seconds}s"
         )
-        self.query_one("#config-menu-native-model", Button).label = (
-            f"Native 模型　{_clip(self._llm_model, 52)}"
-        )
-        self.query_one("#config-menu-openclaw-agent", Button).label = (
-            f"OpenClaw Agent ID　{_clip(self._openclaw_agent_id, 48)}"
-        )
 
     def _mark_dirty(self) -> None:
         self.query_one("#config-editor-save-hint", Static).update(
@@ -842,7 +1000,14 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
 
     def _focus_controls(self) -> list[Button]:
         return [
-            self.query_one("#config-menu-backend", Button),
+            self.query_one("#config-menu-api-endpoint", Button),
+            self.query_one("#config-menu-api-key", Button),
+            self.query_one("#config-menu-native-model", Button),
+            self.query_one("#config-menu-groups", Button),
+            self.query_one("#config-menu-raw-enabled", Button),
+            self.query_one("#config-menu-raw-account", Button),
+            self.query_one("#config-menu-hourly-summary", Button),
+            self.query_one("#config-menu-daily-summary", Button),
             self.query_one("#config-menu-proactive-mode", Button),
             self.query_one("#config-menu-probability", Button),
             self.query_one("#config-menu-mention-policy", Button),
@@ -850,8 +1015,6 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
             self.query_one("#config-menu-continuation-max", Button),
             self.query_one("#config-menu-continuation-delay", Button),
             self.query_one("#config-menu-continuation-ttl", Button),
-            self.query_one("#config-menu-native-model", Button),
-            self.query_one("#config-menu-openclaw-agent", Button),
             self.query_one("#config-menu-save", Button),
             self.query_one("#config-menu-cancel", Button),
         ]
@@ -894,7 +1057,7 @@ class RunDashboard(App[None]):
         background: #070b10;
     }
 
-    GroupPickerScreen, AskScreen, MemoryEditorScreen, ConfigScreen, ConfigBackendScreen, ConfigProactiveModeScreen, ConfigMentionPolicyScreen, ConfigValueScreen {
+    GroupPickerScreen, AskScreen, MemoryEditorScreen, ConfigScreen, ConfigBackendScreen, ConfigProactiveModeScreen, ConfigMentionPolicyScreen, ConfigValueScreen, ConfigGroupSelectionScreen {
         align: center middle;
     }
 
@@ -985,7 +1148,8 @@ class RunDashboard(App[None]):
 
     #config-editor {
         width: 92;
-        height: 20;
+        height: 90%;
+        overflow-y: auto;
         padding: 1 2;
         border: round #5ccfe6;
         background: #0b1118;
@@ -1097,6 +1261,11 @@ class RunDashboard(App[None]):
         padding: 1 2;
         border: round #5ccfe6;
         background: #0b1118;
+    }
+
+    ConfigGroupSelectionScreen #config-value-editor {
+        height: 90%;
+        overflow-y: auto;
     }
 
     #config-value-title {

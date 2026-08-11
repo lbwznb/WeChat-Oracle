@@ -1,15 +1,21 @@
 """Small `.env` editor used by the terminal UI.
 
 The normal runtime still reads configuration through `config.Settings`. This
-module only handles the operator-facing edit/save path and intentionally keeps
-the first supported surface small: agent backend, native model, OpenClaw agent
-id, probability wake chance, participation posture, and group mention policy.
+module handles the operator-facing edit/save path for the initial native
+SQLite + OpenAI-compatible runtime, including local group authorization and
+automatic-summary switches. Advanced backend fields remain only for source
+compatibility and are not exposed by this UI.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+import os
 from pathlib import Path
+import sqlite3
+import time
+from urllib.parse import urlparse
 
 from .config import Settings
 
@@ -25,6 +31,14 @@ AGENT_CONFIG_KEYS = (
     "WO_AGENT_CONTINUATION_TTL_SECONDS",
     "WO_REPLY_MENTION_POLICY",
     "WO_LLM_MODEL",
+    "WO_LLM_ENDPOINT",
+    "WO_LLM_API_KEY",
+    "WO_GROUPS",
+    "WO_REPLY_ALLOWED_GROUPS",
+    "WO_RAW_WECHAT_ENABLED",
+    "WO_RAW_WECHAT_ACCOUNT",
+    "WO_HOURLY_SUMMARY_ENABLED",
+    "WO_DAILY_SUMMARY_ENABLED",
     "WO_OPENCLAW_AGENT_ID",
 )
 
@@ -45,8 +59,17 @@ class AgentRuntimeConfig:
     openclaw_token_configured: bool = False
     openclaw_configured: bool = False
     pi_configured: bool = False
+    llm_endpoint: str = "https://api.deepseek.com"
+    llm_api_key_update: str | None = None
+    groups: tuple[str, ...] = ()
+    available_groups: tuple[tuple[str, str], ...] = ()
+    raw_wechat_enabled: bool = False
+    raw_wechat_account: str = ""
+    hourly_summary_enabled: bool = False
+    daily_summary_enabled: bool = False
 
     def env_updates(self) -> dict[str, str]:
+        available_names = dict(self.available_groups)
         return {
             "WO_AGENT_BACKEND": self.backend,
             "WO_AGENT_BASE_PROBABILITY": f"{self.agent_base_probability:g}",
@@ -57,6 +80,15 @@ class AgentRuntimeConfig:
             "WO_AGENT_CONTINUATION_TTL_SECONDS": str(self.continuation_ttl_seconds),
             "WO_REPLY_MENTION_POLICY": self.reply_mention_policy,
             "WO_LLM_MODEL": self.llm_model,
+            "WO_LLM_ENDPOINT": self.llm_endpoint,
+            "WO_GROUPS": json.dumps(
+                [available_names.get(group_id, group_id) for group_id in self.groups],
+                ensure_ascii=False,
+            ),
+            "WO_RAW_WECHAT_ENABLED": "true" if self.raw_wechat_enabled else "false",
+            "WO_RAW_WECHAT_ACCOUNT": self.raw_wechat_account,
+            "WO_HOURLY_SUMMARY_ENABLED": "true" if self.hourly_summary_enabled else "false",
+            "WO_DAILY_SUMMARY_ENABLED": "true" if self.daily_summary_enabled else "false",
             "WO_OPENCLAW_AGENT_ID": self.openclaw_agent_id,
         }
 
@@ -64,6 +96,14 @@ class AgentRuntimeConfig:
 def load_agent_runtime_config() -> AgentRuntimeConfig:
     import shutil
     current = Settings()
+    available_groups = _load_authorized_groups(current)
+    selected_groups = tuple(
+        group_id
+        for group_id, display_name in available_groups
+        if group_id in current.groups or display_name in current.groups
+    )
+    if not selected_groups:
+        selected_groups = tuple(current.groups)
     return AgentRuntimeConfig(
         backend=(current.agent_backend or "native").lower(),
         proactive_mode=current.agent_proactive_mode,
@@ -79,6 +119,13 @@ def load_agent_runtime_config() -> AgentRuntimeConfig:
         openclaw_token_configured=bool(current.openclaw_token),
         openclaw_configured=bool(current.openclaw_token and current.openclaw_agent_id),
         pi_configured=bool(shutil.which(current.pi_executable)),
+        llm_endpoint=current.llm_endpoint,
+        groups=selected_groups,
+        available_groups=available_groups,
+        raw_wechat_enabled=current.raw_wechat_enabled,
+        raw_wechat_account=current.raw_wechat_account,
+        hourly_summary_enabled=current.hourly_summary_enabled,
+        daily_summary_enabled=current.daily_summary_enabled,
     )
 
 
@@ -96,12 +143,14 @@ def _validated_updates(config: AgentRuntimeConfig) -> dict[str, str]:
     backend = config.backend.strip().lower()
     proactive_mode = config.proactive_mode.strip().lower()
     llm_model = config.llm_model.strip()
+    llm_endpoint = config.llm_endpoint.strip()
     openclaw_agent_id = config.openclaw_agent_id.strip()
     probability = float(config.agent_base_probability)
     mention_policy = config.reply_mention_policy.strip().lower()
     continuation_max = int(config.continuation_max_followups)
     continuation_delay = int(config.continuation_delay_seconds)
     continuation_ttl = int(config.continuation_ttl_seconds)
+    groups = tuple(dict.fromkeys(item.strip() for item in config.groups if item.strip()))
     if backend not in {"native", "openclaw", "pi"}:
         raise ValueError("后端只能是 native、openclaw 或 pi")
     if not 0.0 <= probability <= 1.0:
@@ -118,9 +167,15 @@ def _validated_updates(config: AgentRuntimeConfig) -> dict[str, str]:
         raise ValueError("continuation TTL must be >= delay")
     if not llm_model:
         raise ValueError("Native 模型不能为空")
-    if not openclaw_agent_id:
+    parsed_endpoint = urlparse(llm_endpoint)
+    if parsed_endpoint.scheme not in {"http", "https"} or not parsed_endpoint.netloc:
+        raise ValueError("模型 API 地址必须是完整的 http(s) URL")
+    if any("\r" in value or "\n" in value for value in (llm_model, llm_endpoint, config.raw_wechat_account)):
+        raise ValueError("配置值不能包含换行")
+    if backend == "openclaw" and not openclaw_agent_id:
         raise ValueError("OpenClaw Agent ID 不能为空")
-    return {
+    available_names = {group_id: name for group_id, name in config.available_groups}
+    updates = {
         "WO_AGENT_BACKEND": backend,
         "WO_AGENT_BASE_PROBABILITY": f"{probability:g}",
         "WO_AGENT_PROACTIVE_MODE": proactive_mode,
@@ -130,8 +185,27 @@ def _validated_updates(config: AgentRuntimeConfig) -> dict[str, str]:
         "WO_AGENT_CONTINUATION_TTL_SECONDS": str(continuation_ttl),
         "WO_REPLY_MENTION_POLICY": mention_policy,
         "WO_LLM_MODEL": llm_model,
+        "WO_LLM_ENDPOINT": llm_endpoint,
+        "WO_GROUPS": json.dumps(
+            [available_names.get(group_id, group_id) for group_id in groups],
+            ensure_ascii=False,
+        ),
+        "WO_REPLY_ALLOWED_GROUPS": json.dumps(
+            [available_names[group_id] for group_id in groups if group_id in available_names],
+            ensure_ascii=False,
+        ),
+        "WO_RAW_WECHAT_ENABLED": "true" if config.raw_wechat_enabled else "false",
+        "WO_RAW_WECHAT_ACCOUNT": config.raw_wechat_account.strip().lower(),
+        "WO_HOURLY_SUMMARY_ENABLED": "true" if config.hourly_summary_enabled else "false",
+        "WO_DAILY_SUMMARY_ENABLED": "true" if config.daily_summary_enabled else "false",
         "WO_OPENCLAW_AGENT_ID": openclaw_agent_id,
     }
+    if config.llm_api_key_update is not None:
+        secret = config.llm_api_key_update.strip()
+        if "\r" in secret or "\n" in secret:
+            raise ValueError("API key 不能包含换行")
+        updates["WO_LLM_API_KEY"] = secret
+    return updates
 
 
 def _update_env_file(path: Path, updates: dict[str, str]) -> None:
@@ -159,7 +233,13 @@ def _update_env_file(path: Path, updates: dict[str, str]) -> None:
         out.append("")
     for key in missing:
         out.append(f"{key}={updates[key]}")
-    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}-{time.time_ns()}")
+    try:
+        temporary.write_text("\n".join(out) + "\n", encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _active_env_key(line: str) -> str | None:
@@ -167,3 +247,25 @@ def _active_env_key(line: str) -> str | None:
     if not stripped or stripped.startswith("#") or "=" not in stripped:
         return None
     return stripped.split("=", 1)[0].strip()
+
+
+def _load_authorized_groups(current: Settings) -> tuple[tuple[str, str], ...]:
+    if not current.db_path.is_file():
+        return ()
+    uri = f"file:{current.db_path.resolve().as_posix()}?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+        rows = conn.execute(
+            """
+            SELECT canonical_group_id, display_name
+              FROM raw_group_authorizations
+             WHERE enabled=1
+             ORDER BY display_name, canonical_group_id
+            """
+        ).fetchall()
+    except sqlite3.Error:
+        return ()
+    finally:
+        if "conn" in locals():
+            conn.close()
+    return tuple((str(row[0]), str(row[1])) for row in rows)

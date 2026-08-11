@@ -1,4 +1,4 @@
-"""Minimal SQLCipher-4 page verification/decryption for WeChat 4.
+"""Authenticated SQLCipher-4 snapshot decryption for the reviewed WeChat 4 build.
 
 The database key is already the raw 32-byte AES key cached by WCDB.  It is
 never formatted into an exception, log message, or return value intended for
@@ -40,11 +40,23 @@ def verify_page1(key: bytes, page: bytes) -> bool:
     """Verify a raw candidate key without decrypting or persisting it."""
     if len(key) != KEY_SIZE or len(page) < PAGE_SIZE:
         return False
-    salt = page[:SALT_SIZE]
-    authenticated = page[SALT_SIZE : PAGE_SIZE - HMAC_SIZE]
-    expected = hmac.new(_mac_key(key, salt), digestmod=hashlib.sha512)
+    return verify_page(key, page, 1, page[:SALT_SIZE])
+
+
+def verify_page(
+    key: bytes,
+    page: bytes,
+    page_number: int,
+    database_salt: bytes,
+) -> bool:
+    """Authenticate one encrypted main-database or WAL page."""
+    if len(key) != KEY_SIZE or len(page) != PAGE_SIZE or page_number <= 0:
+        return False
+    salt_offset = SALT_SIZE if page_number == 1 else 0
+    authenticated = page[salt_offset : PAGE_SIZE - HMAC_SIZE]
+    expected = hmac.new(_mac_key(key, database_salt), digestmod=hashlib.sha512)
     expected.update(authenticated)
-    expected.update((1).to_bytes(4, "little"))
+    expected.update(page_number.to_bytes(4, "little"))
     return hmac.compare_digest(expected.digest(), page[PAGE_SIZE - HMAC_SIZE : PAGE_SIZE])
 
 
@@ -88,9 +100,12 @@ def decrypt_database(key: bytes, source: Path, destination: Path) -> int:
         raise ValueError("encrypted database size is not page-aligned")
     destination.parent.mkdir(parents=True, exist_ok=True)
     pages = 0
+    database_salt = read_page1(source)[:SALT_SIZE]
     with source.open("rb") as src, destination.open("xb") as dst:
         while page := src.read(PAGE_SIZE):
             pages += 1
+            if not verify_page(key, page, pages, database_salt):
+                raise ValueError(f"encrypted database page {pages} failed authentication")
             dst.write(_decrypt_page(key, page, pages))
     return pages
 

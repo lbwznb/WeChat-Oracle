@@ -27,12 +27,17 @@ def register_group_alias(
     canonical_id: str,
 ) -> str:
     alias = ui_group_id(group_name)
+    existing = conn.execute(
+        "SELECT canonical_group_id FROM group_aliases WHERE alias_id=?",
+        (alias,),
+    ).fetchone()
+    if existing is not None and str(existing[0]) != canonical_id:
+        raise ValueError("group display-name alias is already bound to another canonical chatroom")
     conn.execute(
         """
         INSERT INTO group_aliases(alias_id, canonical_group_id, group_name, updated_at)
         VALUES (?, ?, ?, ?)
         ON CONFLICT(alias_id) DO UPDATE SET
-            canonical_group_id=excluded.canonical_group_id,
             group_name=excluded.group_name,
             updated_at=excluded.updated_at
         """,
