@@ -8,6 +8,7 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "cryptography>=46.0.0",
     "faster-whisper>=1.2.1",
     "httpx>=0.28.1",
     "loguru>=0.7.3",
@@ -19,8 +20,15 @@ dependencies = [
     "rapidocr-onnxruntime>=1.4.4",
     "textual>=8.2.5",
     "typer>=0.25.1",
+    "tzdata>=2025.2; sys_platform == 'win32'",
     # Windows-only: wx4py drives WeChat's GUI for sending replies.
     "wx4py; sys_platform == 'win32'",  # UI-automation backend for sending replies; supports WeChat 4.1.x (Qt)
+]
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.22,<7",
+    "pytest>=8.3",
 ]
 
 [project.scripts]

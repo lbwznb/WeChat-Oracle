@@ -1,4 +1,4 @@
--- WeChat-Oracle SQLite schema (v1)
+-- WeChat-Oracle SQLite schema (v3)
 -- Single source of truth for normalized chat messages.
 -- Status field drives the downstream pipeline (mm -> segmenter -> indexer).
 
@@ -28,6 +28,18 @@ CREATE INDEX IF NOT EXISTS idx_messages_group_t       ON messages (group_id, t);
 CREATE INDEX IF NOT EXISTS idx_messages_status        ON messages (status);
 CREATE INDEX IF NOT EXISTS idx_messages_sender        ON messages (sender_wxid);
 CREATE INDEX IF NOT EXISTS idx_messages_wx_msg_id     ON messages (wx_msg_id);
+
+-- Maps display-name-derived UI ids onto a verified real @chatroom id. This
+-- keeps raw history, UI live events, dispatcher context, and daily summaries
+-- in one canonical group without exposing account metadata.
+CREATE TABLE IF NOT EXISTS group_aliases (
+    alias_id            TEXT PRIMARY KEY,
+    canonical_group_id  TEXT NOT NULL,
+    group_name          TEXT NOT NULL,
+    updated_at          REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_group_aliases_canonical
+    ON group_aliases(canonical_group_id);
 
 -- Lightweight per-group state: cursor for incremental backfill, last-seen for live polling.
 CREATE TABLE IF NOT EXISTS group_state (
@@ -69,6 +81,38 @@ CREATE TABLE IF NOT EXISTS command_runs (
     status      TEXT NOT NULL CHECK (status IN ('running', 'ok', 'error')),
     result      TEXT
 );
+
+-- Idempotent automatic summaries and their delivery state. `unknown` means
+-- the UI send may have happened; it is deliberately never auto-retried.
+CREATE TABLE IF NOT EXISTS summary_runs (
+    run_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id        TEXT NOT NULL,
+    group_name      TEXT,
+    period_start    INTEGER NOT NULL,
+    period_end      INTEGER NOT NULL,
+    trigger_kind    TEXT NOT NULL CHECK(trigger_kind IN ('daily', 'manual')),
+    status          TEXT NOT NULL CHECK(status IN ('running', 'skipped', 'ready', 'sent', 'failed', 'unknown')),
+    message_count   INTEGER NOT NULL DEFAULT 0,
+    summary_text    TEXT,
+    result          TEXT NOT NULL DEFAULT '',
+    started_at      REAL NOT NULL,
+    finished_at     REAL,
+    UNIQUE(group_id, period_start, period_end, trigger_kind)
+);
+CREATE INDEX IF NOT EXISTS idx_summary_runs_period
+    ON summary_runs(period_end, status);
+
+CREATE TABLE IF NOT EXISTS delivery_outbox (
+    delivery_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    summary_run_id  INTEGER NOT NULL UNIQUE REFERENCES summary_runs(run_id) ON DELETE CASCADE,
+    status          TEXT NOT NULL CHECK(status IN ('pending', 'sending', 'sent', 'failed', 'unknown')),
+    attempt_count   INTEGER NOT NULL DEFAULT 0,
+    last_error      TEXT NOT NULL DEFAULT '',
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_delivery_outbox_status
+    ON delivery_outbox(status, updated_at);
 
 -- ---------- Agent loop + memory (CLAUDE.md F17, see plan in commit history) ----------
 -- The dispatcher's @<bot> chat path runs through a multi-turn tool-calling agent
@@ -187,4 +231,5 @@ CREATE TABLE IF NOT EXISTS schema_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
-INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('version', '1');
+INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('version', '2');
+UPDATE schema_meta SET value = '2' WHERE key = 'version';

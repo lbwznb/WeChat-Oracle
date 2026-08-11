@@ -130,6 +130,51 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "ON agent_proactive_outbox(continuation_token)"
     )
 
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS summary_runs (
+            run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id TEXT NOT NULL,
+            group_name TEXT,
+            period_start INTEGER NOT NULL,
+            period_end INTEGER NOT NULL,
+            trigger_kind TEXT NOT NULL CHECK(trigger_kind IN ('daily', 'manual')),
+            status TEXT NOT NULL CHECK(status IN ('running', 'skipped', 'ready', 'sent', 'failed', 'unknown')),
+            message_count INTEGER NOT NULL DEFAULT 0,
+            summary_text TEXT,
+            result TEXT NOT NULL DEFAULT '',
+            started_at REAL NOT NULL,
+            finished_at REAL,
+            UNIQUE(group_id, period_start, period_end, trigger_kind)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_summary_runs_period "
+        "ON summary_runs(period_end, status)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS delivery_outbox (
+            delivery_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            summary_run_id INTEGER NOT NULL UNIQUE,
+            status TEXT NOT NULL CHECK(status IN ('pending', 'sending', 'sent', 'failed', 'unknown')),
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT NOT NULL DEFAULT '',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_delivery_outbox_status "
+        "ON delivery_outbox(status, updated_at)"
+    )
+    conn.execute(
+        "INSERT INTO schema_meta(key, value) VALUES('version', '3') "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+    )
+
 
 @contextmanager
 def get_conn(db_path: Path | None = None) -> Iterator[sqlite3.Connection]:

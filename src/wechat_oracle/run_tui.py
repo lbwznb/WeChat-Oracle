@@ -276,7 +276,7 @@ class ConfigValueScreen(ModalScreen[str | None]):
 
 
 class ConfigBackendScreen(ModalScreen[str | None]):
-    """Pick native/openclaw in a dedicated option dialog."""
+    """Pick native/openclaw/pi in a dedicated option dialog."""
 
     BINDINGS = [
         ("escape", "cancel", "取消"),
@@ -290,6 +290,7 @@ class ConfigBackendScreen(ModalScreen[str | None]):
     def compose(self) -> ComposeResult:
         native_state = "已配置" if self._config.native_configured else "不可用：缺少 WO_LLM_API_KEY"
         openclaw_state = "已配置" if self._config.openclaw_token_configured else "不可用：缺少 WO_OPENCLAW_TOKEN"
+        pi_state = "已配置" if self._config.pi_configured else "不可用：找不到 Pi CLI"
         with Vertical(id="config-backend-picker"):
             yield Static("选择 Agent 后端", id="config-backend-title")
             yield Button(
@@ -306,12 +307,22 @@ class ConfigBackendScreen(ModalScreen[str | None]):
                 disabled=not self._config.openclaw_token_configured,
                 compact=True,
             )
+            yield Button(
+                f"{_current_marker(self._current, 'pi')}Pi：本机隔离 RPC（{pi_state}）",
+                id="config-backend-pi",
+                classes="config-menu-item",
+                disabled=not self._config.pi_configured,
+                compact=True,
+            )
             with Horizontal(id="config-backend-buttons"):
                 yield Button("取消", id="config-cancel", compact=True)
             yield Static("点击一个选项，或用 Tab/方向键切换后按回车；Esc 取消", id="config-backend-help")
 
     def on_mount(self) -> None:
-        target_id = "#config-backend-openclaw" if self._current == "openclaw" else "#config-backend-native"
+        target_id = {
+            "openclaw": "#config-backend-openclaw",
+            "pi": "#config-backend-pi",
+        }.get(self._current, "#config-backend-native")
         try:
             target = self.query_one(target_id, Button)
             if not target.disabled:
@@ -335,6 +346,8 @@ class ConfigBackendScreen(ModalScreen[str | None]):
             self.dismiss("native")
         elif event.button.id == "config-backend-openclaw":
             self.dismiss("openclaw")
+        elif event.button.id == "config-backend-pi":
+            self.dismiss("pi")
         elif event.button.id == "config-cancel":
             self.action_cancel()
 
@@ -542,7 +555,7 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
     def __init__(self, config: AgentRuntimeConfig) -> None:
         super().__init__()
         self._config = config
-        self._backend = config.backend if config.backend in {"native", "openclaw"} else "native"
+        self._backend = config.backend if config.backend in {"native", "openclaw", "pi"} else "native"
         self._proactive_mode = (
             config.proactive_mode
             if config.proactive_mode in {"off", "reactive", "proactive"}
@@ -571,7 +584,7 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
         with Vertical(id="config-editor"):
             yield Static("运行配置", id="config-editor-title")
             yield Static(
-                f"Native：{native_state}　OpenClaw：{openclaw_state}",
+                f"Native：{native_state}　OpenClaw：{openclaw_state}　Pi：{'已配置' if self._config.pi_configured else '找不到 CLI'}",
                 id="config-editor-meta",
             )
             yield Static("改完后需要保存才会写入 .env，并重启调度进程。", id="config-editor-save-hint")
@@ -1412,7 +1425,8 @@ def status_lines_for_processes(
     backend = (agent_config.backend or "native").lower()
     agent_label = (
         f"openclaw/{agent_config.openclaw_agent_id}"
-        if backend == "openclaw" else f"native/{agent_config.llm_model}"
+        if backend == "openclaw"
+        else (f"pi/{settings.pi_model}" if backend == "pi" else f"native/{agent_config.llm_model}")
     )
     balance_label = _balance_label(backend, native_configured=agent_config.native_configured)
     proc_bits = []

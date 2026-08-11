@@ -44,6 +44,7 @@ class AgentRuntimeConfig:
     native_configured: bool = False
     openclaw_token_configured: bool = False
     openclaw_configured: bool = False
+    pi_configured: bool = False
 
     def env_updates(self) -> dict[str, str]:
         return {
@@ -61,6 +62,7 @@ class AgentRuntimeConfig:
 
 
 def load_agent_runtime_config() -> AgentRuntimeConfig:
+    import shutil
     current = Settings()
     return AgentRuntimeConfig(
         backend=(current.agent_backend or "native").lower(),
@@ -76,6 +78,7 @@ def load_agent_runtime_config() -> AgentRuntimeConfig:
         native_configured=bool(current.llm_api_key),
         openclaw_token_configured=bool(current.openclaw_token),
         openclaw_configured=bool(current.openclaw_token and current.openclaw_agent_id),
+        pi_configured=bool(shutil.which(current.pi_executable)),
     )
 
 
@@ -99,8 +102,8 @@ def _validated_updates(config: AgentRuntimeConfig) -> dict[str, str]:
     continuation_max = int(config.continuation_max_followups)
     continuation_delay = int(config.continuation_delay_seconds)
     continuation_ttl = int(config.continuation_ttl_seconds)
-    if backend not in {"native", "openclaw"}:
-        raise ValueError("后端只能是 native 或 openclaw")
+    if backend not in {"native", "openclaw", "pi"}:
+        raise ValueError("后端只能是 native、openclaw 或 pi")
     if not 0.0 <= probability <= 1.0:
         raise ValueError("触发概率必须在 0 到 1 之间")
     if proactive_mode not in {"off", "reactive", "proactive"}:
