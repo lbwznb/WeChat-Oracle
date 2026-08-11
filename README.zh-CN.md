@@ -76,6 +76,27 @@ uv run wechat-oracle run
 
 `setup` 会写入最小 `.env`，`doctor` 检查数据库、WeFlow、所选 agent backend 和回复路径，`run` 用一个小型终端 UI 启动 live ingest 与 dispatcher。Windows 上 setup 完成后也可以双击 `scripts\run.bat`。
 
+## Windows 便携 EXE
+
+请在 Windows x64 上构建 console 模式的 `onedir` 包：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1
+```
+
+产物位于 `dist\WeChatOracle\WeChatOracle.exe`。必须保留并交付整个 `dist\WeChatOracle` 目录，不能只复制 EXE，因为程序依赖同目录下的 `_internal`。未带参数首次启动且没有 `.env` 时会进入 `setup`；配置完成后，未带参数启动会直接运行助手。也可以显式执行：
+
+```powershell
+.\WeChatOracle.exe doctor
+.\WeChatOracle.exe init-db
+.\WeChatOracle.exe run
+.\WeChatOracle.exe openclaw mcp-serve
+```
+
+构建过程明确排除 `.env`、`data/`、人物档案、日志、微信原始数据库、数据库密钥和 `experimental/raw_wechat`。请把便携目录放在普通用户可写的位置，不要放进 `Program Files`；运行配置和数据保存在 EXE 同目录。首次使用语音识别时，语音模型会下载到用户缓存。
+
+`wx4py` 使用 AGPL-3.0-or-later 许可证。构建脚本会把它的许可证和 `THIRD_PARTY_NOTICES.md` 复制到产物中。本机个人构建可以测试，但对外分发前必须先确认相应的源码提供及其他许可证义务。
+
 运行 `setup` 前，请先安装并启动 WeFlow，在 WeFlow 设置里启用 HTTP API 服务，并准备好 access token。
 
 如果要手工配置，在仓库根目录创建 `.env`。先写公共配置：

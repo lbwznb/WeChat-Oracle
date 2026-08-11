@@ -38,6 +38,9 @@ class Settings(BaseSettings):
     # WeFlow HTTP API (used by `ingest live`); enable "HTTP API 服务" in WeFlow settings.
     weflow_base_url: str = "http://127.0.0.1:5031"
     weflow_token: str = ""
+    # weflow = official HTTP/SSE API; wx4py = visible WeChat UI only. The UI
+    # fallback cannot recover sender identity and archives only text/link rows.
+    ingest_backend: str = "weflow"
 
     # Dispatcher: bot's @-mention nickname (its 群昵称 in the watched group).
     # Required for `wechat-oracle dispatcher` to recognize commands.
@@ -67,6 +70,13 @@ class Settings(BaseSettings):
     dispatcher_worker_threads: int = 4       # global parallel workers; wx4py send is serialized separately
     dispatcher_candidate_limit: int = 500   # /find candidates per call
     dispatcher_context_chat: int = 2500     # legacy candidate cap for summary-style paths
+
+    # Automatic summary of the previous Asia/Hong_Kong natural day. Kept
+    # opt-in so installing/configuring the project can never send by surprise.
+    daily_summary_enabled: bool = False
+    daily_summary_min_messages: int = 5
+    daily_summary_chunk_chars: int = 800
+    daily_summary_send_delay_seconds: float = 1.2
 
     # LLM output caps. `llm_max_tokens` is the fallback; specialized values let
     # long-context chat/summaries breathe while keeping short utility commands cheap.
@@ -152,12 +162,21 @@ class Settings(BaseSettings):
     openclaw_agent_id: str = "wechat-bot"
     openclaw_timeout_seconds: float = 300.0
 
+    # Pi RPC runtime. Pi keeps provider credentials in its own agent directory;
+    # WeChat Oracle only starts the CLI and never reads or copies those secrets.
+    pi_executable: str = "pi"
+    pi_provider: str = "opencode-go"
+    pi_model: str = "deepseek-v4-flash"
+    pi_thinking: str = "low"
+    pi_timeout_seconds: float = 300.0
+
     # Which agent backend dispatcher uses for chat-trigger turns:
     #   native    — in-process Phase A + Phase B with tools (default; works
     #               with just an LLM API key, no extra component to install)
     #   openclaw  — delegate the whole loop to OpenClaw's wechat-bot agent
     #               via /v1/chat/completions (requires WO_OPENCLAW_*; recommended
     #               for production because of subscription pricing)
+    #   pi        — isolated text-only Pi RPC calls, reusing Pi's local auth
     # In openclaw mode, mention/free-chat, slash-command text/JSON completions,
     # and lurk reflection all go through the OpenClaw gateway.
     agent_backend: str = "native"
@@ -167,12 +186,17 @@ class Settings(BaseSettings):
     reply: bool = True
 
     # Reply backend choice. See replier.py for trade-offs.
-    #   wx4py  — UI automation. Requires Windows + WeChat main window visible.
-    #   stdout — No-op. Equivalent to reply=False.
+    #   wx4py     — ordinary UI automation, including mouse control clicks.
+    #   uia-direct — no-mouse UIA selection + focused keyboard submission.
+    #   stdout    — No-op. Equivalent to reply=False.
     # (Tencent iLink Bot was prototyped + rejected; can't deliver group msgs.
     #  See README "实验记录" if you're tempted to try again.)
     reply_backend: str = "wx4py"
     reply_mention_policy: str = "explicit"  # always/explicit/never group @ policy
+    # Exact display-name allowlist for UI sends. Empty deliberately blocks
+    # UI sends; group ids cannot identify a UI conversation safely.
+    reply_allowed_groups: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    reply_fail_closed: bool = True
 
     @field_validator("groups", mode="before")
     @classmethod
@@ -187,6 +211,11 @@ class Settings(BaseSettings):
             return [item.strip() for item in s.split(",") if item.strip()]
         return v
 
+    @field_validator("reply_allowed_groups", mode="before")
+    @classmethod
+    def _split_reply_groups(cls, v: object) -> object:
+        return cls._split_csv(v)
+
     @field_validator("agent_proactive_mode")
     @classmethod
     def _validate_agent_proactive_mode(cls, v: str) -> str:
@@ -194,6 +223,39 @@ class Settings(BaseSettings):
         if mode not in {"off", "reactive", "proactive"}:
             raise ValueError("WO_AGENT_PROACTIVE_MODE must be one of: off, reactive, proactive")
         return mode
+
+    @field_validator("agent_backend")
+    @classmethod
+    def _validate_agent_backend(cls, v: str) -> str:
+        backend = (v or "native").strip().lower()
+        if backend not in {"native", "openclaw", "pi"}:
+            raise ValueError("WO_AGENT_BACKEND must be one of: native, openclaw, pi")
+        return backend
+
+    @field_validator("ingest_backend")
+    @classmethod
+    def _validate_ingest_backend(cls, v: str) -> str:
+        backend = (v or "weflow").strip().lower()
+        if backend not in {"weflow", "wx4py"}:
+            raise ValueError("WO_INGEST_BACKEND must be one of: weflow, wx4py")
+        return backend
+
+    @field_validator("pi_thinking")
+    @classmethod
+    def _validate_pi_thinking(cls, v: str) -> str:
+        level = (v or "low").strip().lower()
+        if level not in {"off", "minimal", "low", "medium", "high", "xhigh", "max"}:
+            raise ValueError("WO_PI_THINKING has an unsupported level")
+        return level
+
+    @field_validator("pi_provider", "pi_model")
+    @classmethod
+    def _validate_pi_identifier(cls, v: str) -> str:
+        import re
+        value = (v or "").strip()
+        if not value or not re.fullmatch(r"[A-Za-z0-9._/@:+-]+", value):
+            raise ValueError("Pi provider/model contains unsupported shell characters")
+        return value
 
     @field_validator("reply_mention_policy")
     @classmethod

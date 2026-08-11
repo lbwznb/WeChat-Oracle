@@ -60,6 +60,45 @@ def _row(msg: Message) -> dict:
     }
 
 
+def _reconcile_exact_ui_live(conn: sqlite3.Connection, msg: Message) -> bool:
+    """Upgrade one exact UI-live row with raw identity instead of duplicating it."""
+    if msg.source != "backfill" or not msg.wx_msg_id:
+        return False
+    rows = conn.execute(
+        """
+        SELECT msg_id
+          FROM messages
+         WHERE group_id=? AND t=? AND type=?
+           AND COALESCE(content_text, '')=COALESCE(?, '')
+           AND source='live' AND wx_msg_id LIKE 'ui-live:%'
+        LIMIT 2
+        """,
+        (msg.group_id, msg.t, msg.type.value, msg.content_text),
+    ).fetchall()
+    if len(rows) != 1:
+        return False
+    try:
+        changed = conn.execute(
+            """
+            UPDATE messages
+               SET wx_msg_id=?, sender_wxid=?, sender_display=?,
+                   dedupe_key=?, group_name=COALESCE(?, group_name)
+             WHERE msg_id=? AND source='live' AND wx_msg_id LIKE 'ui-live:%'
+            """,
+            (
+                msg.wx_msg_id,
+                msg.sender_wxid,
+                msg.sender_display,
+                msg.compute_dedupe_key(),
+                msg.group_name,
+                rows[0]["msg_id"],
+            ),
+        )
+    except sqlite3.IntegrityError:
+        return False
+    return bool(changed.rowcount)
+
+
 def _write_forwarded_for_batch(
     conn: sqlite3.Connection, parents: list[Message]
 ) -> int:
@@ -144,7 +183,15 @@ def write_messages(
         by_type = Counter(m.type.value for m in batch_msgs)
         by_group = Counter(m.group_id for m in batch_msgs)
         with transaction(conn):
-            cur = conn.executemany(INSERT_SQL, [_row(m) for m in batch_msgs])
+            can_reconcile = bool(
+                conn.execute("SELECT 1 FROM messages WHERE source='live' LIMIT 1").fetchone()
+            )
+            pending = [
+                message
+                for message in batch_msgs
+                if not (can_reconcile and _reconcile_exact_ui_live(conn, message))
+            ]
+            cur = conn.executemany(INSERT_SQL, [_row(m) for m in pending])
             batch_inserted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
             batch_fwd_inserted = _write_forwarded_for_batch(conn, batch_msgs)
             inserted += batch_inserted

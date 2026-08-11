@@ -68,6 +68,17 @@ def _configure_stdio_utf8() -> None:
                 pass
 
 
+def _self_command(*args: str) -> list[str]:
+    """Launch this CLI from source or from the frozen Windows executable."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable, *args]
+    return ["uv", "run", "wechat-oracle", *args]
+
+
+def _self_command_text(*args: str) -> str:
+    return subprocess.list2cmdline(_self_command(*args))
+
+
 def _env_bool(value: bool) -> str:
     return "True" if value else "False"
 
@@ -106,11 +117,20 @@ def setup(
     typer.echo("WeChat Oracle setup")
     typer.echo("Press Enter to accept defaults. Secrets are written only to .env.")
     typer.echo("")
-    typer.echo("WeFlow is required and is not installed by this command.")
-    typer.echo(_weflow_setup_hint())
+    typer.echo("Choose WeFlow HTTP/SSE or the limited wx4py visible-UI source.")
+    typer.echo("The setup command does not install either external application.")
     typer.echo("")
 
-    weflow_token = typer.prompt("WeFlow token", default=settings.weflow_token or "", hide_input=True)
+    ingest_backend = typer.prompt(
+        "Ingest backend (weflow/wx4py)", default=settings.ingest_backend
+    ).strip().lower()
+    if ingest_backend not in {"weflow", "wx4py"}:
+        typer.echo("Ingest backend must be 'weflow' or 'wx4py'.")
+        raise typer.Exit(1)
+    weflow_token = (
+        typer.prompt("WeFlow token", default=settings.weflow_token or "", hide_input=True)
+        if ingest_backend == "weflow" else ""
+    )
     groups = typer.prompt(
         "Groups to monitor (empty = all group chats exposed by WeFlow)",
         default=",".join(settings.groups),
@@ -118,29 +138,32 @@ def setup(
     )
     bot_name = typer.prompt("Bot group nickname (WO_BOT_NAME)", default=settings.bot_name or "")
     reply_backend = typer.prompt(
-        "Reply backend (wx4py/stdout)",
+        "Reply backend (uia-direct/wx4py/stdout)",
         default=settings.reply_backend or "wx4py",
     ).strip().lower()
-    if reply_backend not in {"wx4py", "stdout"}:
-        typer.echo("Reply backend must be 'wx4py' or 'stdout'.")
+    if reply_backend not in {"uia-direct", "wx4py", "stdout"}:
+        typer.echo("Reply backend must be 'uia-direct', 'wx4py', or 'stdout'.")
         raise typer.Exit(1)
     reply = reply_backend != "stdout"
 
     backend = typer.prompt(
-        "Agent backend (native/openclaw)",
+        "Agent backend (native/openclaw/pi)",
         default=settings.agent_backend or "native",
     ).strip().lower()
-    if backend not in {"native", "openclaw"}:
-        typer.echo("Agent backend must be 'native' or 'openclaw'.")
+    if backend not in {"native", "openclaw", "pi"}:
+        typer.echo("Agent backend must be 'native', 'openclaw', or 'pi'.")
         raise typer.Exit(1)
     values: dict[str, str] = {
         "WO_WEFLOW_BASE_URL": settings.weflow_base_url,
         "WO_WEFLOW_TOKEN": weflow_token,
+        "WO_INGEST_BACKEND": ingest_backend,
         "WO_GROUPS": groups,
         "WO_BOT_NAME": bot_name,
         "WO_REPLY": _env_bool(reply),
         "WO_REPLY_BACKEND": reply_backend,
         "WO_REPLY_MENTION_POLICY": settings.reply_mention_policy,
+        "WO_REPLY_ALLOWED_GROUPS": groups,
+        "WO_REPLY_FAIL_CLOSED": _env_bool(settings.reply_fail_closed),
         "WO_AGENT_BACKEND": backend,
         "WO_AGENT_BASE_PROBABILITY": str(settings.agent_base_probability),
         "WO_AGENT_PROACTIVE_MODE": settings.agent_proactive_mode,
@@ -169,6 +192,17 @@ def setup(
                     default=settings.openclaw_agent_id,
                 ),
                 "WO_OPENCLAW_TIMEOUT_SECONDS": str(settings.openclaw_timeout_seconds),
+            }
+        )
+    elif backend == "pi":
+        values.update(
+            {
+                "WO_PI_EXECUTABLE": typer.prompt("Pi executable", default=settings.pi_executable),
+                "WO_PI_PROVIDER": typer.prompt("Pi provider", default=settings.pi_provider),
+                "WO_PI_MODEL": typer.prompt("Pi model", default=settings.pi_model),
+                "WO_PI_THINKING": typer.prompt("Pi thinking level", default=settings.pi_thinking),
+                "WO_PI_TIMEOUT_SECONDS": str(settings.pi_timeout_seconds),
+                "WO_LLM_MODEL": settings.pi_model,
             }
         )
     else:
@@ -215,8 +249,8 @@ def setup(
     init_db()
     typer.echo(f"\nwrote {env_path}")
     typer.echo("next:")
-    typer.echo("  uv run wechat-oracle doctor")
-    typer.echo("  uv run wechat-oracle run")
+    typer.echo(f"  {_self_command_text('doctor')}")
+    typer.echo(f"  {_self_command_text('run')}")
 
 
 def _doctor_line(name: str, ok: bool, detail: str) -> bool:
@@ -248,7 +282,16 @@ def doctor() -> None:
         "all group chats" if not settings.groups else ", ".join(settings.groups),
     )
 
-    if not settings.weflow_token:
+    if settings.ingest_backend == "wx4py":
+        try:
+            __import__("wx4py")
+            failures += not _doctor_line(
+                "UI ingest", bool(settings.groups),
+                f"wx4py import ok; groups={settings.groups!r}" if settings.groups else "WO_GROUPS is empty",
+            )
+        except Exception as e:
+            failures += not _doctor_line("UI ingest", False, f"wx4py import failed: {e}")
+    elif not settings.weflow_token:
         failures += not _doctor_line(
             "WeFlow API",
             False,
@@ -303,6 +346,17 @@ def doctor() -> None:
                 )
             except Exception as e:
                 failures += not _doctor_line("OpenClaw gateway", False, f"{type(e).__name__}: {e}")
+    elif backend == "pi":
+        from .llm import PiRpcLLM
+        client = PiRpcLLM(
+            executable=settings.pi_executable,
+            provider=settings.pi_provider,
+            model=settings.pi_model,
+            thinking=settings.pi_thinking,
+            timeout_seconds=settings.pi_timeout_seconds,
+        )
+        available, detail = client.check_available()
+        failures += not _doctor_line("Pi RPC", available, detail)
     else:
         failures += not _doctor_line(
             "LLM config",
@@ -311,10 +365,19 @@ def doctor() -> None:
             if settings.llm_api_key else "WO_LLM_API_KEY is empty",
         )
 
-    if settings.reply and settings.reply_backend == "wx4py":
+    if settings.reply and settings.reply_backend in {"wx4py", "uia-direct"}:
+        failures += not _doctor_line(
+            "reply allowlist",
+            bool(settings.reply_allowed_groups),
+            ", ".join(settings.reply_allowed_groups) if settings.reply_allowed_groups else "WO_REPLY_ALLOWED_GROUPS is empty",
+        )
         try:
             __import__("wx4py")
-            failures += not _doctor_line("reply backend", True, "wx4py import ok")
+            failures += not _doctor_line(
+                "reply backend",
+                True,
+                f"{settings.reply_backend}: wx4py import ok",
+            )
         except Exception as e:
             failures += not _doctor_line("reply backend", False, f"wx4py import failed: {e}")
     else:
@@ -671,9 +734,10 @@ def run(
         init_db()
     settings.ensure_dirs()
     procs: dict[str, subprocess.Popen[str]] = {}
+    ingest_command = "ui-live" if settings.ingest_backend == "wx4py" else "live"
     commands = {
-        "live": ["uv", "run", "wechat-oracle", "ingest", "live"],
-        "dispatcher": ["uv", "run", "wechat-oracle", "dispatcher"],
+        "live": _self_command("ingest", ingest_command),
+        "dispatcher": _self_command("dispatcher"),
     }
     process_lock = threading.Lock()
     manual_restarts: set[str] = set()
@@ -953,11 +1017,31 @@ def ingest_live() -> None:
     run_live()
 
 
+@ingest_app.command("ui-live")
+def ingest_ui_live() -> None:
+    """Read text/link events from exact visible WeChat groups via wx4py UIA."""
+    from .ingest.ui_live import run_ui_live
+    from .log_utils import setup_process_log
+    setup_process_log("live")
+    run_ui_live()
+
+
+@ingest_app.command("ui-probe")
+def ingest_ui_probe(
+    group: str = typer.Argument(..., help="Exact WeChat group display name"),
+) -> None:
+    """Open one group read-only and report wx4py compatibility; sends nothing."""
+    import json
+    from .ingest.ui_live import probe_ui_group
+    result = probe_ui_group(group)
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+
+
 @app.command("dispatcher")
 def dispatcher_cmd() -> None:
     """Watch DB for `@<bot> /find ...` commands; print results to stdout + log.
 
-    Requires WO_BOT_NAME and WO_LLM_API_KEY in .env. Runs in foreground;
+    Requires WO_BOT_NAME and a configured selected agent backend. Runs in foreground;
     Ctrl+C to stop. Safe to run alongside `ingest live`.
     """
     from .dispatcher import run_dispatcher
@@ -1330,10 +1414,11 @@ def openclaw_mcp_test() -> None:
 
     async def run() -> None:
         # mcp.client.stdio does NOT inherit parent env by default, so pass it
-        # through explicitly for PATH/HOME/etc. used by the spawned `uv run`.
+        # through explicitly for PATH/HOME/etc. used by the spawned process.
+        mcp_command = _self_command("openclaw", "mcp-serve")
         params = StdioServerParameters(
-            command="uv",
-            args=["run", "wechat-oracle", "openclaw", "mcp-serve"],
+            command=mcp_command[0],
+            args=mcp_command[1:],
             env=dict(os.environ),
         )
         async with stdio_client(params) as (read, write):
@@ -1419,6 +1504,8 @@ def openclaw_mcp_serve() -> None:
 
       openclaw mcp set wechat-oracle \\
         --command "uv" --args "run wechat-oracle openclaw mcp-serve"
+
+    A portable build uses ``WeChatOracle.exe openclaw mcp-serve`` instead.
 
     Exposes the full OpenClaw tool surface: history search, quote/forward
     expansion, media reads, and memory/persona read-write tools.

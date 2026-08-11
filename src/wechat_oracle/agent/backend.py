@@ -81,6 +81,9 @@ def _build() -> AgentBackend:
     if name == "openclaw":
         from .backends.openclaw import OpenClawBackend
         return OpenClawBackend()
+    if name == "pi":
+        from .backends.pi import PiBackend
+        return PiBackend()
     raise ValueError(
-        f"unknown WO_AGENT_BACKEND={name!r} (valid: native, openclaw)"
+        f"unknown WO_AGENT_BACKEND={name!r} (valid: native, openclaw, pi)"
     )

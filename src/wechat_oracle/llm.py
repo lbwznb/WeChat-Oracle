@@ -22,7 +22,13 @@ from __future__ import annotations
 import base64
 import html
 import json
+import os
+import queue
 import re
+import shutil
+import subprocess
+import tempfile
+import threading
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
@@ -174,6 +180,206 @@ class OpenAICompatLLM:
             tool_calls=tool_calls,
             assistant_message=_coerce_assistant_message(msg),
         )
+
+
+class PiRpcLLM:
+    """Ephemeral, tool-disabled adapter for Pi's JSONL RPC mode.
+
+    Every completion gets a fresh process and an isolated system-prompt file.
+    Pi reads provider credentials from its own config; this class never opens
+    the auth file and never includes credentials in logs or exceptions.
+    """
+
+    name = "pi-rpc"
+
+    def __init__(
+        self,
+        *,
+        executable: str = "pi",
+        provider: str,
+        model: str,
+        thinking: str = "low",
+        timeout_seconds: float = 300.0,
+    ) -> None:
+        self.executable = executable
+        self.provider = provider
+        self.model = model
+        self.thinking = thinking
+        self.timeout_seconds = timeout_seconds
+
+    def complete_text(
+        self,
+        *,
+        model: str,
+        system: str,
+        user: str,
+        temperature: float = 0.3,
+        max_tokens: int | None = None,
+    ) -> str:
+        # Pi owns sampling/output settings for the selected model. Keep the
+        # common LLM protocol args for call-site compatibility.
+        del model, temperature, max_tokens
+        return self._complete(system=system, user=user).strip()
+
+    def complete_json(
+        self,
+        *,
+        model: str,
+        system: str,
+        user: str,
+        temperature: float = 0.0,
+    ) -> str:
+        del model, temperature
+        json_system = system.rstrip() + (
+            "\n\n只输出一个合法 JSON 值，不要使用 Markdown 代码块或附加解释。"
+        )
+        return self._complete(system=json_system, user=user).strip()
+
+    def check_available(self) -> tuple[bool, str]:
+        resolved = shutil.which(self.executable)
+        if not resolved:
+            return False, f"executable {self.executable!r} not found on PATH"
+        return True, f"{resolved} provider={self.provider!r} model={self.model!r}"
+
+    def _complete(self, *, system: str, user: str) -> str:
+        ok, detail = self.check_available()
+        if not ok:
+            raise RuntimeError(f"Pi RPC unavailable: {detail}")
+        resolved_executable = shutil.which(self.executable)
+        assert resolved_executable is not None
+        if os.name == "nt" and re.search(r"[&|<>^]", resolved_executable):
+            raise RuntimeError("Pi executable path contains unsafe cmd.exe metacharacters")
+
+        prompt_path: str | None = None
+        proc: subprocess.Popen[bytes] | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", suffix=".md", delete=False
+            ) as prompt_file:
+                prompt_file.write(system)
+                prompt_path = prompt_file.name
+
+            pi_args = [
+                resolved_executable,
+                "--mode", "rpc",
+                "--no-session",
+                "--no-tools",
+                "--no-extensions",
+                "--no-skills",
+                "--no-prompt-templates",
+                "--no-context-files",
+                "--no-approve",
+                "--provider", self.provider,
+                "--model", self.model,
+                "--thinking", self.thinking,
+                "--system-prompt", prompt_path,
+            ]
+            if os.name == "nt" and resolved_executable.lower().endswith((".cmd", ".bat")):
+                # Windows cannot CreateProcess a batch shim directly. The
+                # command line contains only fixed/configured args; user text
+                # still travels over stdin and is never shell-interpreted.
+                cmd = [
+                    os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c",
+                    subprocess.list2cmdline(pi_args),
+                ]
+            else:
+                cmd = pi_args
+            creationflags = 0
+            if os.name == "nt":
+                creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
+            assert proc.stdin is not None and proc.stdout is not None
+            records: queue.Queue[bytes | None] = queue.Queue()
+
+            def _reader() -> None:
+                assert proc is not None and proc.stdout is not None
+                while True:
+                    line = proc.stdout.readline()
+                    if not line:
+                        records.put(None)
+                        return
+                    records.put(line)
+
+            threading.Thread(target=_reader, name="pi-rpc-reader", daemon=True).start()
+            self._write_rpc(proc, {"id": "prompt", "type": "prompt", "message": user})
+
+            import time as _time
+            deadline = _time.monotonic() + self.timeout_seconds
+            settled = False
+            while _time.monotonic() < deadline:
+                try:
+                    line = records.get(timeout=max(0.01, deadline - _time.monotonic()))
+                except queue.Empty:
+                    break
+                if line is None:
+                    break
+                event = _decode_rpc_line(line)
+                if event.get("type") == "response" and event.get("id") == "prompt" and not event.get("success"):
+                    raise RuntimeError(f"Pi RPC rejected prompt: {event.get('error') or 'unknown error'}")
+                if event.get("type") == "agent_settled":
+                    settled = True
+                    break
+            if not settled:
+                raise TimeoutError(f"Pi RPC did not settle within {self.timeout_seconds:g}s")
+
+            self._write_rpc(proc, {"id": "result", "type": "get_last_assistant_text"})
+            while _time.monotonic() < deadline:
+                try:
+                    line = records.get(timeout=max(0.01, deadline - _time.monotonic()))
+                except queue.Empty:
+                    break
+                if line is None:
+                    break
+                event = _decode_rpc_line(line)
+                if event.get("type") == "response" and event.get("id") == "result":
+                    if not event.get("success"):
+                        raise RuntimeError("Pi RPC could not return assistant text")
+                    value = (event.get("data") or {}).get("text")
+                    return value if isinstance(value, str) else ""
+            raise RuntimeError("Pi RPC exited before returning assistant text")
+        finally:
+            if proc is not None and proc.poll() is None:
+                if os.name == "nt":
+                    subprocess.run(
+                        ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                    )
+                else:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+            if prompt_path:
+                try:
+                    os.unlink(prompt_path)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _write_rpc(proc: subprocess.Popen[bytes], payload: dict[str, Any]) -> None:
+        assert proc.stdin is not None
+        proc.stdin.write(json.dumps(payload, ensure_ascii=False).encode("utf-8") + b"\n")
+        proc.stdin.flush()
+
+
+def _decode_rpc_line(line: bytes) -> dict[str, Any]:
+    try:
+        value = json.loads(line.rstrip(b"\r\n").decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Pi RPC emitted an invalid JSONL record") from exc
+    if not isinstance(value, dict):
+        raise RuntimeError("Pi RPC emitted a non-object JSONL record")
+    return value
 
 
 @dataclass(frozen=True)

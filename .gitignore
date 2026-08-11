@@ -14,6 +14,16 @@ wheels/
 data/
 .env
 
+# Opt-in raw-WeChat experiment: never commit copied/encrypted/decrypted DBs,
+# WAL/SHM files, memory material, recovered keys, or exported chat content.
+experimental/raw_wechat/workspace/
+experimental/raw_wechat/**/*.db
+experimental/raw_wechat/**/*.db-*
+experimental/raw_wechat/**/*.key
+experimental/raw_wechat/**/*keys*.json
+experimental/raw_wechat/**/*.dump
+experimental/raw_wechat/**/*.json
+
 # Claude Code: ignore by default, carve out the parts that codify project contracts
 .claude/*
 !.claude/settings.json
