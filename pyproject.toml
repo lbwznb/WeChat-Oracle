@@ -10,7 +10,7 @@ requires-python = ">=3.12"
 dependencies = [
     "cryptography>=46.0.0",
     "faster-whisper>=1.2.1",
-    "httpx>=0.28.1",
+    "httpx[socks]>=0.28.1",
     "loguru>=0.7.3",
     "mcp>=1.0.0",
     "openai>=1.50.0",

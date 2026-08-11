@@ -10,6 +10,7 @@ in CLAUDE.md「易漂移点 F3」 and the doc-sync hook will remind you.
 """
 from pathlib import Path
 from typing import Annotated
+from zoneinfo import ZoneInfo
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -42,6 +43,14 @@ class Settings(BaseSettings):
     # fallback cannot recover sender identity and archives only text/link rows.
     ingest_backend: str = "weflow"
 
+    # Direct local WeChat 4 archive synchronization. This is strictly opt-in
+    # and only imports canonical groups stored in raw_group_authorizations.
+    raw_wechat_enabled: bool = False
+    raw_wechat_account: str = ""
+    raw_wechat_workspace: Path = Field(default=Path("data/raw_wechat"))
+    raw_wechat_install_root: Path = Field(default=Path(r"D:\0softwear\Weixin"))
+    raw_wechat_sync_interval_seconds: float = 60.0
+
     # Dispatcher: bot's @-mention nickname (its 群昵称 in the watched group).
     # Required for `wechat-oracle dispatcher` to recognize commands.
     bot_name: str = ""
@@ -71,12 +80,18 @@ class Settings(BaseSettings):
     dispatcher_candidate_limit: int = 500   # /find candidates per call
     dispatcher_context_chat: int = 2500     # legacy candidate cap for summary-style paths
 
-    # Automatic summary of the previous Asia/Hong_Kong natural day. Kept
-    # opt-in so installing/configuring the project can never send by surprise.
+    # Automatic summaries. Both are opt-in; the grace period gives the local
+    # WeChat database watcher time to publish the final rows for a boundary.
+    hourly_summary_enabled: bool = False
+    hourly_summary_min_messages: int = 5
     daily_summary_enabled: bool = False
     daily_summary_min_messages: int = 5
     daily_summary_chunk_chars: int = 800
     daily_summary_send_delay_seconds: float = 1.2
+    summary_timezone: str = "Asia/Hong_Kong"
+    summary_sync_grace_seconds: int = 300
+    summary_generation_lease_seconds: int = 900
+    summary_sending_lease_seconds: int = 300
 
     # LLM output caps. `llm_max_tokens` is the fallback; specialized values let
     # long-context chat/summaries breathe while keeping short utility commands cheap.
@@ -116,6 +131,10 @@ class Settings(BaseSettings):
     @property
     def write_max_tokens(self) -> int:
         return self.llm_write_max_tokens or self.llm_max_tokens
+
+    @property
+    def summary_tz(self) -> ZoneInfo:
+        return ZoneInfo(self.summary_timezone)
 
     # Agent loop (multi-turn tool-calling chat path). Triggers are classified
     # cheaply in dispatcher: direct @, quote-reply to bot, or optional
@@ -191,7 +210,7 @@ class Settings(BaseSettings):
     #   stdout    — No-op. Equivalent to reply=False.
     # (Tencent iLink Bot was prototyped + rejected; can't deliver group msgs.
     #  See README "实验记录" if you're tempted to try again.)
-    reply_backend: str = "wx4py"
+    reply_backend: str = "uia-direct"
     reply_mention_policy: str = "explicit"  # always/explicit/never group @ policy
     # Exact display-name allowlist for UI sends. Empty deliberately blocks
     # UI sends; group ids cannot identify a UI conversation safely.
@@ -240,6 +259,22 @@ class Settings(BaseSettings):
             raise ValueError("WO_INGEST_BACKEND must be one of: weflow, wx4py")
         return backend
 
+    @field_validator("raw_wechat_account")
+    @classmethod
+    def _validate_raw_wechat_account(cls, v: str) -> str:
+        import re
+        value = (v or "").strip().lower()
+        if value and not re.fullmatch(r"[0-9a-f]{12}", value):
+            raise ValueError("WO_RAW_WECHAT_ACCOUNT must be a 12-character fingerprint")
+        return value
+
+    @field_validator("raw_wechat_sync_interval_seconds")
+    @classmethod
+    def _validate_raw_wechat_interval(cls, v: float) -> float:
+        if v < 30:
+            raise ValueError("WO_RAW_WECHAT_SYNC_INTERVAL_SECONDS must be at least 30")
+        return v
+
     @field_validator("pi_thinking")
     @classmethod
     def _validate_pi_thinking(cls, v: str) -> str:
@@ -264,6 +299,24 @@ class Settings(BaseSettings):
         if policy not in {"always", "explicit", "never"}:
             raise ValueError("WO_REPLY_MENTION_POLICY must be one of: always, explicit, never")
         return policy
+
+    @field_validator("summary_timezone")
+    @classmethod
+    def _validate_summary_timezone(cls, v: str) -> str:
+        value = (v or "Asia/Hong_Kong").strip()
+        ZoneInfo(value)
+        return value
+
+    @field_validator(
+        "summary_sync_grace_seconds",
+        "summary_generation_lease_seconds",
+        "summary_sending_lease_seconds",
+    )
+    @classmethod
+    def _validate_summary_seconds(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("summary timing values must be non-negative")
+        return v
 
     @field_validator("agent_continuation_max_followups")
     @classmethod
@@ -290,6 +343,8 @@ class Settings(BaseSettings):
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.media_dir.mkdir(parents=True, exist_ok=True)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.raw_wechat_enabled:
+            self.raw_wechat_workspace.mkdir(parents=True, exist_ok=True)
 
 
 

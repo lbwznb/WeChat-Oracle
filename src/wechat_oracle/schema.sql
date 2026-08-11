@@ -41,6 +41,32 @@ CREATE TABLE IF NOT EXISTS group_aliases (
 CREATE INDEX IF NOT EXISTS idx_group_aliases_canonical
     ON group_aliases(canonical_group_id);
 
+-- Explicit local-WeChat read authorization. The display name is informational;
+-- the security boundary is the anonymous account fingerprint + real chatroom id.
+CREATE TABLE IF NOT EXISTS raw_group_authorizations (
+    account_fingerprint TEXT NOT NULL,
+    canonical_group_id  TEXT NOT NULL,
+    display_name        TEXT NOT NULL,
+    contact_generation TEXT NOT NULL,
+    enabled             INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+    created_at          REAL NOT NULL,
+    updated_at          REAL NOT NULL,
+    PRIMARY KEY(account_fingerprint, canonical_group_id)
+);
+
+CREATE TABLE IF NOT EXISTS raw_import_cursors (
+    account_fingerprint TEXT NOT NULL,
+    canonical_group_id  TEXT NOT NULL,
+    shard_id             TEXT NOT NULL,
+    database_generation TEXT NOT NULL,
+    last_local_id        INTEGER NOT NULL DEFAULT 0,
+    updated_at           REAL NOT NULL,
+    PRIMARY KEY(account_fingerprint, canonical_group_id, shard_id),
+    FOREIGN KEY(account_fingerprint, canonical_group_id)
+        REFERENCES raw_group_authorizations(account_fingerprint, canonical_group_id)
+        ON DELETE CASCADE
+);
+
 -- Lightweight per-group state: cursor for incremental backfill, last-seen for live polling.
 CREATE TABLE IF NOT EXISTS group_state (
     group_id            TEXT PRIMARY KEY,
@@ -90,13 +116,17 @@ CREATE TABLE IF NOT EXISTS summary_runs (
     group_name      TEXT,
     period_start    INTEGER NOT NULL,
     period_end      INTEGER NOT NULL,
-    trigger_kind    TEXT NOT NULL CHECK(trigger_kind IN ('daily', 'manual')),
+    trigger_kind    TEXT NOT NULL CHECK(trigger_kind IN ('hourly', 'daily', 'manual')),
     status          TEXT NOT NULL CHECK(status IN ('running', 'skipped', 'ready', 'sent', 'failed', 'unknown')),
     message_count   INTEGER NOT NULL DEFAULT 0,
     summary_text    TEXT,
     result          TEXT NOT NULL DEFAULT '',
     started_at      REAL NOT NULL,
     finished_at     REAL,
+    generation_attempt_count INTEGER NOT NULL DEFAULT 1,
+    lease_token     TEXT,
+    lease_until     REAL,
+    updated_at      REAL NOT NULL DEFAULT 0,
     UNIQUE(group_id, period_start, period_end, trigger_kind)
 );
 CREATE INDEX IF NOT EXISTS idx_summary_runs_period
@@ -231,5 +261,5 @@ CREATE TABLE IF NOT EXISTS schema_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
-INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('version', '2');
-UPDATE schema_meta SET value = '2' WHERE key = 'version';
+INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('version', '4');
+UPDATE schema_meta SET value = '4' WHERE key = 'version';

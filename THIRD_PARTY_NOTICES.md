@@ -8,4 +8,11 @@ The portable Windows build includes third-party Python packages and native libra
 - Project: https://github.com/ChenyqThu/wx4py
 - The build script copies the complete wx4py license to `licenses/wx4py-LICENSE.txt` in the portable output.
 
+## cryptography
+
+- License: Apache-2.0 OR BSD-3-Clause.
+- Project: https://github.com/pyca/cryptography
+- Used only for authenticated decryption of user-authorized local WeChat snapshots.
+- The build script copies the wheel's license files into `licenses/`.
+
 This repository's MIT license does not override third-party terms. The current binary workflow is intended for local personal testing. Review all corresponding-source, attribution, notice, and redistribution obligations before distributing a build to others.

@@ -18,6 +18,7 @@ Adding a subcommand: also update README quickstart + process table
 from pathlib import Path
 from collections import deque
 from datetime import datetime
+import json
 import os
 import re
 import signal
@@ -42,12 +43,78 @@ worker_app = typer.Typer(no_args_is_help=True, help="Background workers that fil
 verify_app = typer.Typer(no_args_is_help=True, help="Health checks for the dispatch pipeline.")
 agent_app = typer.Typer(no_args_is_help=True, help="Inspect & manage agent memory (persona_drift / group_memory / run logs).")
 openclaw_app = typer.Typer(no_args_is_help=True, help="OpenClaw runtime backend (the recommended agent path; uses subscription instead of per-token API).")
+raw_app = typer.Typer(no_args_is_help=True, help="Authorized read-only local WeChat database synchronization.")
 app.add_typer(ingest_app, name="ingest")
 app.add_typer(weflow_app, name="weflow")
 app.add_typer(worker_app, name="worker")
 app.add_typer(verify_app, name="verify")
 app.add_typer(agent_app, name="agent")
 app.add_typer(openclaw_app, name="openclaw")
+app.add_typer(raw_app, name="raw")
+
+
+def _run_raw_command(command: str, *args: str) -> None:
+    from .raw_wechat.cli import main as raw_main
+
+    code = raw_main([command, *args])
+    if code:
+        raise typer.Exit(code)
+
+
+@raw_app.command("scan")
+def raw_scan() -> None:
+    """Discover anonymous local WeChat accounts and numeric message shards."""
+    _run_raw_command("scan")
+
+
+@raw_app.command("groups")
+def raw_groups(
+    account: str = typer.Option("", "--account", help="Anonymous account fingerprint"),
+) -> None:
+    """Decrypt the current contact snapshot and list selectable chatrooms."""
+    _run_raw_command("groups", *(["--account", account] if account else []))
+
+
+@raw_app.command("authorize")
+def raw_authorize(
+    canonical_id: str = typer.Argument(..., help="Exact @chatroom id returned by raw groups"),
+    account: str = typer.Option("", "--account", help="Anonymous account fingerprint"),
+) -> None:
+    """Authorize one exact canonical group for local archive reads."""
+    args = ["--canonical-id", canonical_id]
+    if account:
+        args.extend(["--account", account])
+    _run_raw_command("authorize", *args)
+
+
+@raw_app.command("revoke")
+def raw_revoke(
+    canonical_id: str = typer.Argument(...),
+    account: str = typer.Option("", "--account"),
+) -> None:
+    """Disable future reads for one previously authorized group."""
+    args = ["--canonical-id", canonical_id]
+    if account:
+        args.extend(["--account", account])
+    _run_raw_command("revoke", *args)
+
+
+@raw_app.command("sync")
+def raw_sync(account: str = typer.Option("", "--account")) -> None:
+    """Run one incremental synchronization for all authorized groups."""
+    _run_raw_command("sync", *(["--account", account] if account else []))
+
+
+@raw_app.command("run")
+def raw_run(account: str = typer.Option("", "--account")) -> None:
+    """Continuously synchronize all authorized groups."""
+    _run_raw_command("run", *(["--account", account] if account else []))
+
+
+@raw_app.command("status")
+def raw_status() -> None:
+    """Show sanitized local WeChat authorization and process status."""
+    _run_raw_command("status")
 
 
 def _configure_stdio_utf8() -> None:
@@ -117,11 +184,15 @@ def setup(
     typer.echo("WeChat Oracle setup")
     typer.echo("Press Enter to accept defaults. Secrets are written only to .env.")
     typer.echo("")
-    typer.echo("Choose WeFlow HTTP/SSE or the limited wx4py visible-UI source.")
-    typer.echo("The setup command does not install either external application.")
+    typer.echo("Core runtime: local SQLite memory + OpenAI-compatible API.")
+    typer.echo("Local WeChat database access is optional and read-only.")
     typer.echo("")
 
-    ingest_backend = typer.prompt(
+    use_local_db = typer.confirm(
+        "Read and continuously monitor the local WeChat chat database?",
+        default=settings.raw_wechat_enabled,
+    )
+    ingest_backend = "wx4py" if use_local_db else typer.prompt(
         "Ingest backend (weflow/wx4py)", default=settings.ingest_backend
     ).strip().lower()
     if ingest_backend not in {"weflow", "wx4py"}:
@@ -131,8 +202,8 @@ def setup(
         typer.prompt("WeFlow token", default=settings.weflow_token or "", hide_input=True)
         if ingest_backend == "weflow" else ""
     )
-    groups = typer.prompt(
-        "Groups to monitor (empty = all group chats exposed by WeFlow)",
+    groups = "" if use_local_db else typer.prompt(
+        "Groups to monitor (comma-separated)",
         default=",".join(settings.groups),
         show_default=False,
     )
@@ -146,13 +217,9 @@ def setup(
         raise typer.Exit(1)
     reply = reply_backend != "stdout"
 
-    backend = typer.prompt(
-        "Agent backend (native/openclaw/pi)",
-        default=settings.agent_backend or "native",
-    ).strip().lower()
-    if backend not in {"native", "openclaw", "pi"}:
-        typer.echo("Agent backend must be 'native', 'openclaw', or 'pi'.")
-        raise typer.Exit(1)
+    backend = "native"
+    hourly_summary = typer.confirm("Send a summary after each completed hour?", default=False)
+    daily_summary = typer.confirm("Send the previous-day summary after midnight?", default=False)
     values: dict[str, str] = {
         "WO_WEFLOW_BASE_URL": settings.weflow_base_url,
         "WO_WEFLOW_TOKEN": weflow_token,
@@ -173,55 +240,30 @@ def setup(
         "WO_AGENT_LURK_ENABLED": _env_bool(settings.agent_lurk_enabled),
         "WO_AGENT_LURK_INTERVAL_SECONDS": str(settings.agent_lurk_interval_seconds),
         "WO_AGENT_LURK_MIN_NEW_MESSAGES": str(settings.agent_lurk_min_new_messages),
+        "WO_RAW_WECHAT_ENABLED": _env_bool(use_local_db),
+        "WO_RAW_WECHAT_ACCOUNT": "",
+        "WO_RAW_WECHAT_SYNC_INTERVAL_SECONDS": str(settings.raw_wechat_sync_interval_seconds),
+        "WO_HOURLY_SUMMARY_ENABLED": _env_bool(hourly_summary),
+        "WO_DAILY_SUMMARY_ENABLED": _env_bool(daily_summary),
+        "WO_SUMMARY_SYNC_GRACE_SECONDS": str(settings.summary_sync_grace_seconds),
     }
 
-    if backend == "openclaw":
-        values.update(
-            {
-                "WO_OPENCLAW_GATEWAY_URL": typer.prompt(
-                    "OpenClaw gateway URL",
-                    default=settings.openclaw_gateway_url,
-                ),
-                "WO_OPENCLAW_TOKEN": typer.prompt(
-                    "OpenClaw gateway token",
-                    default=settings.openclaw_token or "",
-                    hide_input=True,
-                ),
-                "WO_OPENCLAW_AGENT_ID": typer.prompt(
-                    "OpenClaw agent id",
-                    default=settings.openclaw_agent_id,
-                ),
-                "WO_OPENCLAW_TIMEOUT_SECONDS": str(settings.openclaw_timeout_seconds),
-            }
-        )
-    elif backend == "pi":
-        values.update(
-            {
-                "WO_PI_EXECUTABLE": typer.prompt("Pi executable", default=settings.pi_executable),
-                "WO_PI_PROVIDER": typer.prompt("Pi provider", default=settings.pi_provider),
-                "WO_PI_MODEL": typer.prompt("Pi model", default=settings.pi_model),
-                "WO_PI_THINKING": typer.prompt("Pi thinking level", default=settings.pi_thinking),
-                "WO_PI_TIMEOUT_SECONDS": str(settings.pi_timeout_seconds),
-                "WO_LLM_MODEL": settings.pi_model,
-            }
-        )
-    else:
-        values.update(
-            {
-                "WO_LLM_PROVIDER": settings.llm_provider,
-                "WO_LLM_API_KEY": typer.prompt(
-                    "LLM API key",
-                    default=settings.llm_api_key or "",
-                    hide_input=True,
-                ),
-                "WO_LLM_ENDPOINT": typer.prompt(
-                    "LLM endpoint",
-                    default=settings.llm_endpoint,
-                ),
-                "WO_LLM_MODEL": typer.prompt("LLM model", default=settings.llm_model),
-                "WO_LLM_JSON_MODE": settings.llm_json_mode,
-            }
-        )
+    values.update(
+        {
+            "WO_LLM_PROVIDER": "openai-compatible",
+            "WO_LLM_API_KEY": typer.prompt(
+                "LLM API key",
+                default=settings.llm_api_key or "",
+                hide_input=True,
+            ),
+            "WO_LLM_ENDPOINT": typer.prompt(
+                "LLM endpoint",
+                default=settings.llm_endpoint,
+            ),
+            "WO_LLM_MODEL": typer.prompt("LLM model", default=settings.llm_model),
+            "WO_LLM_JSON_MODE": settings.llm_json_mode,
+        }
+    )
 
     if typer.confirm("Configure optional vision model for image reading?", default=False):
         values.update(
@@ -246,11 +288,98 @@ def setup(
         )
 
     _write_env(env_path, values, force=force)
+    os.environ.update(values)
+    from .config import reload_settings
+    reload_settings()
     init_db()
+    if use_local_db:
+        _interactive_raw_group_setup(env_path)
     typer.echo(f"\nwrote {env_path}")
     typer.echo("next:")
     typer.echo(f"  {_self_command_text('doctor')}")
     typer.echo(f"  {_self_command_text('run')}")
+
+
+def _interactive_raw_group_setup(env_path: Path) -> None:
+    """Discover one account and let the operator authorize exact chatrooms."""
+    from .config_store import _update_env_file
+    from .raw_wechat.cli import (
+        _account_lock,
+        _account_map,
+        _authorize_group,
+        _cleanup_decrypted,
+        _latest_contact,
+        _resolve_install_root,
+        _select_account,
+        _unlock_contact,
+    )
+    from .raw_wechat.importer import list_groups
+    from .raw_wechat.inventory import discover_message_databases
+    from .raw_wechat.profile_41155 import verify_install
+
+    typer.echo("\nScanning the reviewed WeChat 4 local database layout...")
+    candidates = discover_message_databases()
+    accounts = _account_map(candidates)
+    if not accounts:
+        typer.echo("No supported local WeChat database was found. You can retry later from `raw scan`.")
+        return
+    if len(accounts) == 1:
+        account = next(iter(accounts))
+    else:
+        typer.echo("Detected anonymous accounts:")
+        for index, fingerprint in enumerate(sorted(accounts), 1):
+            typer.echo(f"  {index}. {fingerprint} ({len(accounts[fingerprint])} shards)")
+        selected = typer.prompt("Account number", type=int)
+        ordered = sorted(accounts)
+        if selected < 1 or selected > len(ordered):
+            raise typer.BadParameter("account number is out of range")
+        account = ordered[selected - 1]
+    _, account_candidates = _select_account(candidates, account)
+    verify_install(_resolve_install_root(settings.raw_wechat_install_root))
+    typer.echo("Reading the current contact snapshot; this may take a while on first run...")
+    with _account_lock(settings.raw_wechat_workspace, account):
+        unlocked = _unlock_contact(account_candidates[0], settings.raw_wechat_workspace)
+        if "contact.db" in unlocked["failures"]:
+            raise RuntimeError("the current contact database could not be verified")
+        message_dbs: list[Path] = []
+        contact_db = _latest_contact(settings.raw_wechat_workspace, account)
+        options = list_groups(contact_db)
+    if not options:
+        raise RuntimeError("no joined WeChat groups were found in the current contact snapshot")
+    typer.echo("Selectable groups:")
+    for index, option in enumerate(options, 1):
+        typer.echo(f"  {index}. {option.display_name}  [{option.canonical_group_id}]")
+    raw = typer.prompt("Group numbers to monitor/summarize (comma-separated)")
+    indexes: list[int] = []
+    for part in raw.split(","):
+        value = int(part.strip())
+        if value < 1 or value > len(options):
+            raise typer.BadParameter("group number is out of range")
+        if value not in indexes:
+            indexes.append(value)
+    selected_options = [options[index - 1] for index in indexes]
+    for option in selected_options:
+        _authorize_group(
+            workspace=settings.raw_wechat_workspace,
+            account_fingerprint=account,
+            archive_path=settings.db_path,
+            canonical_group_id=option.canonical_group_id,
+            cleanup=False,
+        )
+    _cleanup_decrypted(message_dbs, contact_db)
+    updates = {
+        "WO_RAW_WECHAT_ACCOUNT": account,
+        "WO_GROUPS": json.dumps(
+            [option.display_name for option in selected_options], ensure_ascii=False
+        ),
+        "WO_REPLY_ALLOWED_GROUPS": json.dumps(
+            [option.display_name for option in selected_options], ensure_ascii=False
+        ),
+    }
+    _update_env_file(env_path, updates)
+    os.environ.update(updates)
+    from .config import reload_settings
+    reload_settings()
 
 
 def _doctor_line(name: str, ok: bool, detail: str) -> bool:
@@ -703,6 +832,7 @@ def _dashboard_process_label(name: str) -> str:
         "live": "INGEST",
         "dispatcher": "DISPATCH",
         "mm": "MEDIA",
+        "raw-sync": "LOCAL DB",
     }.get(name, name)
 
 
@@ -739,6 +869,10 @@ def run(
         "live": _self_command("ingest", ingest_command),
         "dispatcher": _self_command("dispatcher"),
     }
+    if settings.raw_wechat_enabled:
+        commands["raw-sync"] = _self_command("raw", "run")
+    optional_processes = {"raw-sync"}
+    restart_after: dict[str, float] = {}
     process_lock = threading.Lock()
     manual_restarts: set[str] = set()
     log_lines: deque[str] = deque(maxlen=1000)
@@ -808,6 +942,13 @@ def run(
                 for name, proc in current_procs:
                     code = proc.poll()
                     if code is not None:
+                        if name in optional_processes:
+                            due = restart_after.setdefault(name, time.time() + 30)
+                            if time.time() >= due:
+                                typer.echo(f"{_dashboard_process_label(name)} restarting after exit {code}")
+                                start_process(name)
+                                restart_after.pop(name, None)
+                            continue
                         typer.echo(
                             f"{_dashboard_process_label(name)} exited with code {code}; stopping remaining processes"
                         )
@@ -831,9 +972,22 @@ def run(
                     log_lines.append(
                         _dashboard_log_line(
                             "run",
-                            "config saved to .env; restarting DISPATCH to apply it",
+                            "config saved to .env; restarting runtime processes",
                         )
                     )
+                if settings.raw_wechat_enabled:
+                    commands["raw-sync"] = _self_command("raw", "run")
+                    with process_lock:
+                        raw_proc = procs.get("raw-sync")
+                    if raw_proc is None or raw_proc.poll() is not None:
+                        start_process("raw-sync")
+                else:
+                    commands.pop("raw-sync", None)
+                    with process_lock:
+                        raw_proc = procs.pop("raw-sync", None)
+                    if raw_proc is not None:
+                        _terminate_process_tree(raw_proc)
+                restart_process("live")
                 restart_process("dispatcher")
 
             app = RunDashboard(
@@ -856,6 +1010,19 @@ def run(
                             with process_lock:
                                 if child_name in restarting or procs.get(child_name) is not child_proc:
                                     continue
+                            if child_name in optional_processes:
+                                due = restart_after.setdefault(child_name, time.time() + 30)
+                                if time.time() >= due:
+                                    with log_lock:
+                                        log_lines.append(
+                                            _dashboard_log_line(
+                                                "run",
+                                                f"restarting {_dashboard_process_label(child_name)} after exit {code}",
+                                            )
+                                        )
+                                    start_process(child_name)
+                                    restart_after.pop(child_name, None)
+                                continue
                             with log_lock:
                                 log_lines.append(
                                     _dashboard_log_line(

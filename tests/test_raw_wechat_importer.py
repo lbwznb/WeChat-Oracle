@@ -1,16 +1,57 @@
+import json
 import sqlite3
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from experimental.raw_wechat.importer import (
+from wechat_oracle.raw_wechat.importer import (
+    GroupOption,
     import_group_text_messages,
     import_group_text_messages_many,
     import_group_text_messages_many_with_cursors,
+    list_groups,
     message_table,
 )
+from wechat_oracle.raw_wechat.cli import _authorize_group
 from wechat_oracle.db import get_conn, init_db
+
+
+def test_authorize_group_needs_only_verified_contact_snapshot(tmp_path, monkeypatch) -> None:
+    workspace = tmp_path / "raw"
+    fingerprint = "a" * 12
+    decrypted = workspace / fingerprint / "decrypted"
+    decrypted.mkdir(parents=True)
+    (decrypted / "contact.db").touch()
+    state_path = workspace / fingerprint / "sync-state.json"
+    state_path.write_text(
+        json.dumps({
+            "databases": {"contact.db": {"generation": "contact-v1"}},
+            "imported_signatures": {"message_0.db": {"size": 1}},
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "wechat_oracle.raw_wechat.cli.list_groups",
+        lambda _: [GroupOption("123@chatroom", "人心黄黄")],
+    )
+
+    archive = tmp_path / "archive.db"
+    result = _authorize_group(
+        workspace=workspace,
+        account_fingerprint=fingerprint,
+        archive_path=archive,
+        canonical_group_id="123@chatroom",
+        cleanup=False,
+    )
+
+    assert result["status"] == "authorized"
+    with get_conn(archive) as conn:
+        row = conn.execute(
+            "SELECT display_name, contact_generation, enabled FROM raw_group_authorizations"
+        ).fetchone()
+        assert tuple(row) == ("人心黄黄", "contact-v1", 1)
+    assert "imported_signatures" not in json.loads(state_path.read_text(encoding="utf-8"))
 
 
 def test_importer_resolves_group_maps_sender_and_dedupes(tmp_path: Path) -> None:
@@ -52,6 +93,9 @@ def test_importer_resolves_group_maps_sender_and_dedupes(tmp_path: Path) -> None
             VALUES (?,?,?,?,?,?,?)''',
             [(1, 101, 1, 7, 1000, 2, "你好"), (2, 102, 1, 0, 1001, 4, "收到")],
         )
+    assert [(item.canonical_group_id, item.display_name) for item in list_groups(contact)] == [
+        (group_id, "人心黄黄")
+    ]
     archive = tmp_path / "archive.db"
     init_db(archive)
     with get_conn(archive) as conn:

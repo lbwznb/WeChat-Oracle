@@ -1,4 +1,4 @@
-"""Read-only Windows process scanner for WCDB raw-key cache strings."""
+"""Read-only Windows scanner for verified WCDB key candidates."""
 from __future__ import annotations
 
 import ctypes
@@ -13,6 +13,7 @@ from .crypto import KEY_SIZE, read_page1, verify_page1
 
 PROCESS_VM_READ = 0x0010
 PROCESS_QUERY_INFORMATION = 0x0400
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 MEM_COMMIT = 0x1000
 PAGE_GUARD = 0x100
 READABLE = {0x02, 0x04, 0x08, 0x20, 0x40, 0x80}
@@ -89,6 +90,13 @@ def _kernel32():
     kernel32.ReadProcessMemory.restype = wintypes.BOOL
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
     return kernel32
 
 
@@ -108,6 +116,26 @@ def find_process_ids(image_name: str = "Weixin.exe") -> list[int]:
             ok = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
     finally:
         kernel32.CloseHandle(snapshot)
+    return result
+
+
+def find_process_executables(image_name: str = "Weixin.exe") -> list[Path]:
+    """Return executable paths for running Weixin processes, when queryable."""
+    kernel32 = _kernel32()
+    result: list[Path] = []
+    for pid in find_process_ids(image_name):
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            continue
+        try:
+            size = wintypes.DWORD(32768)
+            buffer = ctypes.create_unicode_buffer(size.value)
+            if kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+                path = Path(buffer.value)
+                if path not in result:
+                    result.append(path)
+        finally:
+            kernel32.CloseHandle(handle)
     return result
 
 

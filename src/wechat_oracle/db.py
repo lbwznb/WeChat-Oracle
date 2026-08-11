@@ -48,6 +48,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
         return any(r["name"] == col for r in rows)
 
+    _migrate_summary_schema(conn)
+
     # last_run_id added when group_memory landed (persona_drift now has the
     # back-pointer too — see schema.sql comment)
     if not _has_column("persona_drift", "last_run_id"):
@@ -138,13 +140,17 @@ def _migrate(conn: sqlite3.Connection) -> None:
             group_name TEXT,
             period_start INTEGER NOT NULL,
             period_end INTEGER NOT NULL,
-            trigger_kind TEXT NOT NULL CHECK(trigger_kind IN ('daily', 'manual')),
+            trigger_kind TEXT NOT NULL CHECK(trigger_kind IN ('hourly', 'daily', 'manual')),
             status TEXT NOT NULL CHECK(status IN ('running', 'skipped', 'ready', 'sent', 'failed', 'unknown')),
             message_count INTEGER NOT NULL DEFAULT 0,
             summary_text TEXT,
             result TEXT NOT NULL DEFAULT '',
             started_at REAL NOT NULL,
             finished_at REAL,
+            generation_attempt_count INTEGER NOT NULL DEFAULT 1,
+            lease_token TEXT,
+            lease_until REAL,
+            updated_at REAL NOT NULL DEFAULT 0,
             UNIQUE(group_id, period_start, period_end, trigger_kind)
         )
         """
@@ -171,9 +177,94 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "ON delivery_outbox(status, updated_at)"
     )
     conn.execute(
-        "INSERT INTO schema_meta(key, value) VALUES('version', '3') "
+        "INSERT INTO schema_meta(key, value) VALUES('version', '4') "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
     )
+
+
+def _migrate_summary_schema(conn: sqlite3.Connection) -> None:
+    """Rebuild v3 summary tables so existing installs accept hourly jobs."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='summary_runs'"
+    ).fetchone()
+    if row is None:
+        return
+    sql = str(row["sql"] or "")
+    columns = {item["name"] for item in conn.execute("PRAGMA table_info(summary_runs)")}
+    required = {"generation_attempt_count", "lease_token", "lease_until", "updated_at"}
+    if "'hourly'" in sql and required.issubset(columns):
+        return
+
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.executescript(
+            """
+            BEGIN IMMEDIATE;
+            ALTER TABLE delivery_outbox RENAME TO delivery_outbox_v3;
+            ALTER TABLE summary_runs RENAME TO summary_runs_v3;
+
+            CREATE TABLE summary_runs (
+                run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id TEXT NOT NULL,
+                group_name TEXT,
+                period_start INTEGER NOT NULL,
+                period_end INTEGER NOT NULL,
+                trigger_kind TEXT NOT NULL CHECK(trigger_kind IN ('hourly', 'daily', 'manual')),
+                status TEXT NOT NULL CHECK(status IN ('running', 'skipped', 'ready', 'sent', 'failed', 'unknown')),
+                message_count INTEGER NOT NULL DEFAULT 0,
+                summary_text TEXT,
+                result TEXT NOT NULL DEFAULT '',
+                started_at REAL NOT NULL,
+                finished_at REAL,
+                generation_attempt_count INTEGER NOT NULL DEFAULT 1,
+                lease_token TEXT,
+                lease_until REAL,
+                updated_at REAL NOT NULL DEFAULT 0,
+                UNIQUE(group_id, period_start, period_end, trigger_kind)
+            );
+            INSERT INTO summary_runs (
+                run_id, group_id, group_name, period_start, period_end,
+                trigger_kind, status, message_count, summary_text, result,
+                started_at, finished_at, generation_attempt_count, updated_at
+            )
+            SELECT run_id, group_id, group_name, period_start, period_end,
+                   trigger_kind, status, message_count, summary_text, result,
+                   started_at, finished_at, 1, COALESCE(finished_at, started_at)
+              FROM summary_runs_v3;
+
+            CREATE TABLE delivery_outbox (
+                delivery_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                summary_run_id INTEGER NOT NULL UNIQUE REFERENCES summary_runs(run_id) ON DELETE CASCADE,
+                status TEXT NOT NULL CHECK(status IN ('pending', 'sending', 'sent', 'failed', 'unknown')),
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            INSERT INTO delivery_outbox (
+                delivery_id, summary_run_id, status, attempt_count,
+                last_error, created_at, updated_at
+            )
+            SELECT delivery_id, summary_run_id, status, attempt_count,
+                   last_error, created_at, updated_at
+              FROM delivery_outbox_v3;
+
+            DROP TABLE delivery_outbox_v3;
+            DROP TABLE summary_runs_v3;
+            CREATE INDEX idx_summary_runs_period ON summary_runs(period_end, status);
+            CREATE INDEX idx_delivery_outbox_status ON delivery_outbox(status, updated_at);
+            COMMIT;
+            """
+        )
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+    violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+    if violations:
+        raise RuntimeError("summary schema migration left invalid foreign keys")
 
 
 @contextmanager

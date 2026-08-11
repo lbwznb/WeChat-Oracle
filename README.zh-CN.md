@@ -11,6 +11,7 @@ WeChat Oracle 通过 [WeFlow](https://github.com/hicccc77/WeFlow) 记录微信�
 ## 功能
 
 - 通过 WeFlow SSE 实时采集微信消息并写入 SQLite。
+- 经用户明确授权后，从本机微信数据库发现群，并只把用户选择的 canonical 群增量写入 SQLite。
 - 导入 WeFlow JSON 历史导出。
 - 存储标准化消息、合并转发子消息、媒体路径、OCR/ASR 文本、命令运行记录、agent 记忆和审计轨迹。
 - 通过 wx4py UI 自动化把回复发回微信群。
@@ -18,6 +19,7 @@ WeChat Oracle 通过 [WeFlow](https://github.com/hicccc77/WeFlow) 记录微信�
 - 被直接 @、被引用回复或概率触发时，支持自由形式的 agent 对话。
 - 支持从终端 UI 或 CLI 进行 Local Ask：选择一个群后直接问 bot，但不把回答发到微信。
 - 支持静默的 `lurk` 学习链路，更新 `group_memory` / `persona_drift`，但不在群里发消息。
+- 可幂等发送“过去一个完整小时”和“过去一个自然日”的详细群聊总结。
 - agent turn 可以使用本进程 native tool loop，也可以委托给 OpenClaw runtime。
 
 ## 架构
@@ -50,16 +52,16 @@ uv run wechat-oracle run
 
 `run` 会同时启动 `ingest live` 和 `dispatcher`。`ingest live` 启动 SSE 订阅，并内嵌一个 mm worker 线程。`dispatcher` 轮询 SQLite，按群串行、跨群并行地处理显式命令和 agent 触发，并把所有 wx4py 发送操作串行化到一个发送线程，保证同一时间只有一个 GUI 操作触碰微信。
 
-默认情况下，`run` 会打开一个 Textual 终端 UI：上方固定显示 bot 配置、当前 Local Ask 群和进程状态，其余区域滚动显示两个子进程的实时日志。按 `a` 会打开一次性的 Local Ask 输入对话框，按 `c` 可以修改 agent 后端、模型、概率唤醒和 @ 策略。保存配置会写回 `.env`，并重启 dispatcher，让微信群回复也使用新的设置。如果想回到原始输出，可以用 `uv run wechat-oracle run --plain`。
+默认情况下，`run` 会打开一个 Textual 终端 UI：上方固定显示配置、当前 Local Ask 群和进程状态，其余区域滚动显示子进程日志。按 `a` 会打开一次性的 Local Ask，按 `c` 可以配置 OpenAI-compatible API、模型、本机读取账号、已授权群、小时/每日总结和回复策略。API key 只允许替换，不会从 `.env` 回显到界面。保存后会原子更新 `.env` 并重启相关进程。首版配置界面固定使用本地 SQLite + native API，不需要 Pi Agent。
 
 ## 环境要求
 
 - Windows 10/11。
-- 微信 PC 4.1.8.107 Qt 版是当前推荐的 wx4py 回复运行版本；较新的 4.1.10.x 可能导致 UI 控制失效。
-- 已启用 HTTP API 的 [WeFlow 桌面端](https://github.com/hicccc77/WeFlow)。本项目不会自动安装 WeFlow；请先安装并启动 WeFlow，在设置里启用 HTTP API 服务，然后把 access token 填入 `WO_WEFLOW_TOKEN`。
+- 微信 PC Qt 版；本机原库读取当前只接受已审查的 Windows Weixin `4.1.11.55`，版本变化后会拒绝继续。
+- 数据源可选：用户授权的本机微信只读同步、WeFlow HTTP/SSE，或 wx4py 可见 UI 回退。
 - Python 3.12+。
 - [uv](https://docs.astral.sh/uv/)。
-- OpenAI-compatible LLM endpoint，或用于 `WO_AGENT_BACKEND=openclaw` 的 OpenClaw local gateway。
+- OpenAI-compatible LLM endpoint。
 
 初始化数据库、历史导入、状态检查和 WeFlow 诊断等非回复流程不需要 wx4py。发回微信群需要微信主窗口可见，不能最小化到托盘。
 
@@ -90,21 +92,24 @@ powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1
 .\WeChatOracle.exe doctor
 .\WeChatOracle.exe init-db
 .\WeChatOracle.exe run
-.\WeChatOracle.exe openclaw mcp-serve
+.\WeChatOracle.exe raw scan
+.\WeChatOracle.exe raw status
 ```
 
-构建过程明确排除 `.env`、`data/`、人物档案、日志、微信原始数据库、数据库密钥和 `experimental/raw_wechat`。请把便携目录放在普通用户可写的位置，不要放进 `Program Files`；运行配置和数据保存在 EXE 同目录。首次使用语音识别时，语音模型会下载到用户缓存。
+构建会包含已审查的本机只读模块，但明确排除 `.env`、`data/`、人物档案、日志、微信原始/解密数据库、数据库密钥和整个 `experimental/`。请把便携目录放在普通用户可写的位置，不要放进 `Program Files`；运行配置和数据保存在 EXE 同目录。首次使用语音识别时，语音模型会下载到用户缓存。
 
 `wx4py` 使用 AGPL-3.0-or-later 许可证。构建脚本会把它的许可证和 `THIRD_PARTY_NOTICES.md` 复制到产物中。本机个人构建可以测试，但对外分发前必须先确认相应的源码提供及其他许可证义务。
 
-运行 `setup` 前，请先安装并启动 WeFlow，在 WeFlow 设置里启用 HTTP API 服务，并准备好 access token。
+运行 `setup` 前先启动微信。若开启本机聊天库读取，setup 会显示匿名账号和群列表，只有用户选择的 exact canonical 群会被持久授权和导入。
 
 如果要手工配置，在仓库根目录创建 `.env`。先写公共配置：
 
 ```env
-# WeFlow
-WO_WEFLOW_TOKEN=<weflow-token>
-WO_GROUPS=
+# 本机读取默认关闭；先通过 setup 查看账号与群。
+WO_RAW_WECHAT_ENABLED=False
+WO_RAW_WECHAT_ACCOUNT=
+WO_RAW_WECHAT_SYNC_INTERVAL_SECONDS=60
+WO_GROUPS=[]
 
 # Bot identity in the target group
 WO_BOT_NAME=<bot-group-nickname>
@@ -113,8 +118,15 @@ WO_BOT_NAME=<bot-group-nickname>
 
 # Reply path
 WO_REPLY=True
-WO_REPLY_BACKEND=wx4py
+WO_REPLY_BACKEND=uia-direct
 WO_REPLY_MENTION_POLICY=explicit
+WO_REPLY_ALLOWED_GROUPS=[]
+
+# 过去完整一小时、过去自然日总结，均需用户显式开启。
+WO_HOURLY_SUMMARY_ENABLED=False
+WO_DAILY_SUMMARY_ENABLED=False
+WO_SUMMARY_TIMEZONE=Asia/Hong_Kong
+WO_SUMMARY_SYNC_GRACE_SECONDS=300
 
 # Optional agent tuning
 WO_AGENT_BASE_PROBABILITY=0.25
@@ -142,9 +154,7 @@ WO_AGENT_LURK_MIN_NEW_MESSAGES=20
 
 `WO_BOT_NAME` 和 `WO_BOT_WXID` 不是同一个东西。`WO_BOT_NAME` 是群昵称，用来识别真实的 `@<bot>`；`WO_BOT_WXID` 是 bot 账号自己的 wxid，只用于判断“用户引用回复的是不是 bot 之前说的话”。dispatcher 通常会从已入库的 bot 消息中自动发现它；如果引用回复 bot 没有唤醒 agent，再手动填写。
 
-然后选择一个 agent backend。
-
-选项 A：直接使用普通 OpenAI-compatible API：
+首版固定使用本地 SQLite 记忆库和普通 OpenAI-compatible API：
 
 ```env
 WO_AGENT_BACKEND=native
@@ -153,7 +163,7 @@ WO_LLM_ENDPOINT=https://api.deepseek.com
 WO_LLM_MODEL=deepseek-v4-pro
 ```
 
-选项 B：使用 OpenClaw 作为 agent runtime：
+源码仍保留 OpenClaw 高级兼容路径，但它不属于首版 setup。需要时可手工配置：
 
 ```env
 WO_AGENT_BACKEND=openclaw
@@ -162,6 +172,8 @@ WO_OPENCLAW_TOKEN=<gateway-token>
 WO_OPENCLAW_AGENT_ID=<your-agent-id>
 WO_OPENCLAW_TIMEOUT_SECONDS=300
 ```
+
+Pi Agent 不会被首版打包、配置或依赖。
 
 然后可以用 supervisor 一起启动：
 
@@ -188,6 +200,31 @@ uv run wechat-oracle dispatcher
 ```
 
 如果 `WO_GROUPS` 为空，live ingest 会监控 WeFlow sessions 当前暴露的所有群聊。也可以把 `WO_GROUPS` 设为逗号分隔的群名、备注或 wxid 列表。
+
+### 本机微信聊天库授权
+
+本机读取只支持已审查的 Weixin `4.1.11.55`，默认关闭。推荐用首次 setup 完成账号和群选择；也可以使用等价 CLI：
+
+```powershell
+# 只显示匿名账号指纹和分片数量，不扫描密钥。
+uv run wechat-oracle raw scan
+
+# 设置 WO_RAW_WECHAT_ENABLED=True 后列群并精确授权 canonical id。
+$account = '<scan 返回的匿名账号指纹>'
+uv run wechat-oracle raw groups --account $account
+uv run wechat-oracle raw authorize '<...@chatroom>' --account $account
+
+# 单次增量同步或常驻监控。
+uv run wechat-oracle raw sync --account $account
+uv run wechat-oracle raw run --account $account
+
+uv run wechat-oracle raw status
+uv run wechat-oracle raw revoke '<...@chatroom>' --account $account
+```
+
+程序只以读权限访问微信进程和源数据库，先复制稳定 DB/WAL，再验证 WAL checksum、commit 边界、每页 HMAC 和 SQLite `quick_check`。密钥只在同步进程内存中使用；日志只记录匿名指纹、计数与状态。临时全库明文在所选消息规范化写入本地 SQLite 后删除。联系人数据库发生代际变化时，原授权会暂停，必须由用户重新选择群。
+
+小时/每日总结仅对同时存在 canonical 群授权和 exact display-name 发送白名单的群生效。发送前崩溃可安全恢复；若崩溃发生在提交发送之后而结果不确定，该条会标记为 `unknown`，不会自动重发，避免群里重复刷屏。
 
 ## 核心命令
 
@@ -476,6 +513,11 @@ transcript 状态：
 | `WO_DB_PATH` | `data/wechat-oracle.db` | SQLite 数据库路径。 |
 | `WO_MEDIA_DIR` | `data/media` | 媒体目录。 |
 | `WO_GROUPS` | `[]` | 空表示所有 WeFlow 群会话；接受逗号字符串或 JSON list。 |
+| `WO_RAW_WECHAT_ENABLED` | `False` | 用户明确同意后启用已审查的本机微信只读同步。 |
+| `WO_RAW_WECHAT_ACCOUNT` | empty | 用户选择的精确匿名账号指纹。 |
+| `WO_RAW_WECHAT_WORKSPACE` | `data/raw_wechat` | 稳定快照与同步状态的 gitignore 目录。 |
+| `WO_RAW_WECHAT_INSTALL_ROOT` | `D:\0softwear\Weixin` | 支持的微信安装目录；也会尝试从运行进程发现。 |
+| `WO_RAW_WECHAT_SYNC_INTERVAL_SECONDS` | `60` | 本机数据库监控间隔，最小 30 秒。 |
 | `WO_LOG_LEVEL` | `INFO` | loguru level。 |
 | `WO_WX4PY_LOG_LEVEL` | `WARNING` | wx4py 内部 Python logging 级别；只有排查 UI 自动化时才建议设为 `INFO`。 |
 | `WO_WEFLOW_BASE_URL` | `http://127.0.0.1:5031` | WeFlow HTTP API root。 |
@@ -491,6 +533,16 @@ transcript 状态：
 | `WO_DISPATCHER_WORKER_THREADS` | `4` | 全局消息 worker；同群消息串行处理，不同群可并行，wx4py 发送仍然串行。 |
 | `WO_DISPATCHER_CANDIDATE_LIMIT` | `500` | `/find` 候选上限。 |
 | `WO_DISPATCHER_CONTEXT_CHAT` | `2500` | 旧聊天上下文上限，部分总结路径仍使用。 |
+| `WO_HOURLY_SUMMARY_ENABLED` | `False` | grace 期后幂等总结过去一个完整钟点。 |
+| `WO_HOURLY_SUMMARY_MIN_MESSAGES` | `5` | 有效消息少于此数量时跳过小时总结。 |
+| `WO_DAILY_SUMMARY_ENABLED` | `False` | 午夜后幂等总结上一个自然日。 |
+| `WO_DAILY_SUMMARY_MIN_MESSAGES` | `5` | 有效消息少于此数量时跳过每日总结。 |
+| `WO_DAILY_SUMMARY_CHUNK_CHARS` | `800` | 单条外发摘要的字符上限。 |
+| `WO_DAILY_SUMMARY_SEND_DELAY_SECONDS` | `1.2` | 多段摘要之间的发送间隔。 |
+| `WO_SUMMARY_TIMEZONE` | `Asia/Hong_Kong` | 小时与自然日边界使用的 IANA 时区。 |
+| `WO_SUMMARY_SYNC_GRACE_SECONDS` | `300` | 周期结束后等待本机数据库同步追平。 |
+| `WO_SUMMARY_GENERATION_LEASE_SECONDS` | `900` | 摘要生成崩溃恢复租约。 |
+| `WO_SUMMARY_SENDING_LEASE_SECONDS` | `300` | 发送租约过期后转 unknown，绝不自动重试。 |
 | `WO_LLM_MAX_TOKENS` | `5000` | 通用输出上限。 |
 | `WO_LLM_CHAT_MAX_TOKENS` | empty | 覆盖 chat 输出上限。 |
 | `WO_LLM_SUM_MAX_TOKENS` | empty | 覆盖 summary 输出上限。 |
@@ -530,8 +582,10 @@ transcript 状态：
 | `WO_OPENCLAW_TIMEOUT_SECONDS` | `300` | OpenClaw gateway 请求超时时间。 |
 | `WO_AGENT_BACKEND` | `native` | `native` 或 `openclaw`。 |
 | `WO_REPLY` | `True` | 是否把回复发回微信。 |
-| `WO_REPLY_BACKEND` | `wx4py` | `wx4py` 或 `stdout`。 |
+| `WO_REPLY_BACKEND` | `uia-direct` | `uia-direct`（无鼠标）、`wx4py` 或 `stdout`。 |
 | `WO_REPLY_MENTION_POLICY` | `explicit` | `always` 每条群回复都 @ 触发者；`explicit` 只在直接/命令/引用触发时 @；`never` 发送普通群消息。 |
+| `WO_REPLY_ALLOWED_GROUPS` | `[]` | 允许 UI 发送的精确群显示名；空列表会阻断真实发送。 |
+| `WO_REPLY_FAIL_CLOSED` | `True` | UI 验证失败时拒绝启动/发送，不静默降级。 |
 
 `WO_WHISPER_MODEL` 由 mm worker 直接读取，默认值为 `small`；可接受值取决于 faster-whisper，常见为 `tiny`、`base`、`small`、`medium`、`large-v3`。
 

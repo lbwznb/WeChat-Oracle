@@ -1,4 +1,4 @@
-"""Discover and stage WeChat 4 databases without exposing account names."""
+"""Discover and stage WeChat 4 databases without exposing account names or paths."""
 from __future__ import annotations
 
 import hashlib
@@ -102,7 +102,7 @@ def stage_database(candidate: DatabaseCandidate, workspace: Path) -> Path:
 def contact_database_for(candidate: DatabaseCandidate) -> DatabaseCandidate:
     """Return the WeChat 4 contact DB belonging to a message candidate."""
     source = candidate.source
-    if source.name != "message_0.db" or source.parent.name != "message":
+    if MESSAGE_DB_NAME.fullmatch(source.name) is None or source.parent.name != "message":
         raise ValueError("contact discovery is supported only for the reviewed WeChat 4 layout")
     contact = source.parent.parent / "contact" / "contact.db"
     if not contact.is_file() or contact.stat().st_size < 4096:

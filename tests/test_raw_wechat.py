@@ -10,19 +10,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-from experimental.raw_wechat.crypto import (
+from wechat_oracle.raw_wechat.crypto import (
     HMAC_SIZE,
     PAGE_SIZE,
     RESERVE_SIZE,
     WAL_VERSION,
     _wal_checksum,
     apply_wal,
+    decrypt_database,
     key_fingerprint,
     verify_page1,
 )
-from experimental.raw_wechat import inventory
-from experimental.raw_wechat.profile_41155 import WCDB_MEMORY_PROTECTION_MASK
-from experimental.raw_wechat.win_memory import candidate_keys
+from wechat_oracle.raw_wechat import inventory
+from wechat_oracle.raw_wechat.profile_41155 import WCDB_MEMORY_PROTECTION_MASK
+from wechat_oracle.raw_wechat.win_memory import candidate_keys
 
 
 def _authenticated_page(key: bytes, salt: bytes) -> bytes:
@@ -42,6 +43,28 @@ def test_verify_page1_accepts_only_matching_raw_key() -> None:
     assert verify_page1(key, page)
     assert not verify_page1(bytes(reversed(key)), page)
     assert len(key_fingerprint(key)) == 12
+
+
+def test_decrypt_database_authenticates_every_main_page(tmp_path: Path) -> None:
+    key = bytes(range(32))
+    salt = bytes(range(16, 32))
+    first = _authenticated_page(key, salt)
+    second = bytearray((index * 9 + 5) % 256 for index in range(PAGE_SIZE))
+    mac_salt = bytes(value ^ 0x3A for value in salt)
+    mac_key = hashlib.pbkdf2_hmac("sha512", key, mac_salt, 2, dklen=32)
+    digest = hmac.new(mac_key, second[: PAGE_SIZE - HMAC_SIZE], hashlib.sha512)
+    digest.update((2).to_bytes(4, "little"))
+    second[PAGE_SIZE - HMAC_SIZE :] = digest.digest()
+    source = tmp_path / "source.db"
+    source.write_bytes(first + second)
+    assert decrypt_database(key, source, tmp_path / "plain.db") == 2
+
+    tampered = bytearray(source.read_bytes())
+    tampered[PAGE_SIZE + 20] ^= 1
+    bad = tmp_path / "bad.db"
+    bad.write_bytes(tampered)
+    with pytest.raises(ValueError, match="page 2"):
+        decrypt_database(key, bad, tmp_path / "bad-plain.db")
 
 
 def test_candidate_keys_matches_wcdb_key_and_salt_without_formatting_secret() -> None:

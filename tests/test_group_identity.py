@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 from wechat_oracle.config import settings
 from wechat_oracle.daily_summary import resolve_daily_groups
 from wechat_oracle.db import get_conn, init_db, transaction
+from wechat_oracle.dispatcher import fetch_candidates
 from wechat_oracle.ingest.group_identity import (
     canonical_group_id,
     register_group_alias,
@@ -21,6 +22,8 @@ def test_alias_unifies_ui_and_raw_group_for_daily_summary(tmp_path: Path, monkey
     canonical = "456@chatroom"
     alias = ui_group_id(group_name)
     monkeypatch.setattr(settings, "groups", [group_name])
+    monkeypatch.setattr(settings, "reply_allowed_groups", [group_name])
+    monkeypatch.setattr(settings, "raw_wechat_enabled", False)
     with get_conn(db_path) as conn:
         with transaction(conn):
             register_group_alias(conn, group_name=group_name, canonical_id=canonical)
@@ -34,6 +37,47 @@ def test_alias_unifies_ui_and_raw_group_for_daily_summary(tmp_path: Path, monkey
                 (alias, group_name, "legacy ui", "legacy-ui"),
                 (canonical, group_name, "raw", "raw"),
             ],
+        )
+        assert resolve_daily_groups(conn) == [(canonical, group_name)]
+        candidates = fetch_candidates(
+            conn,
+            group_id=canonical,
+            target=None,
+            since_t=None,
+            limit=None,
+            bot_name="",
+        )
+        assert [item.content for item in candidates] == ["legacy ui", "raw"]
+
+
+def test_raw_summary_resolution_requires_current_account_authorization(
+    tmp_path: Path, monkeypatch
+) -> None:
+    db_path = tmp_path / "archive.db"
+    init_db(db_path)
+    group_name = "测试群"
+    canonical = "456@chatroom"
+    monkeypatch.setattr(settings, "groups", [canonical])
+    monkeypatch.setattr(settings, "reply_allowed_groups", [group_name])
+    monkeypatch.setattr(settings, "raw_wechat_enabled", True)
+    monkeypatch.setattr(settings, "raw_wechat_account", "0123456789ab")
+    with get_conn(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO messages(group_id,group_name,t,type,content_text,source,status,dedupe_key)
+            VALUES (?,?,1,'text','消息','backfill','raw','raw-one')
+            """,
+            (canonical, group_name),
+        )
+        assert resolve_daily_groups(conn) == []
+        conn.execute(
+            """
+            INSERT INTO raw_group_authorizations
+                (account_fingerprint, canonical_group_id, display_name,
+                 contact_generation, enabled, created_at, updated_at)
+            VALUES (?, ?, ?, 'v1', 1, 1, 1)
+            """,
+            (settings.raw_wechat_account, canonical, group_name),
         )
         assert resolve_daily_groups(conn) == [(canonical, group_name)]
 

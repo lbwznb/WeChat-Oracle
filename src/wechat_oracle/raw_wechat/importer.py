@@ -1,10 +1,11 @@
-"""Normalize a verified Weixin 4.1.11.55 group table into the main archive."""
+"""Normalize authorized Weixin 4.1.11.55 group tables into the main archive."""
 from __future__ import annotations
 
 import hashlib
 import re
 import sqlite3
 from collections.abc import Iterator
+from dataclasses import dataclass
 from itertools import chain
 from pathlib import Path
 
@@ -21,6 +22,29 @@ EXPECTED_MESSAGE_COLUMNS = (
 )
 OUTGOING_ORIGINS = {4, 5}
 SHARD_ID = re.compile(r"^message_(\d+)")
+
+
+@dataclass(frozen=True)
+class GroupOption:
+    canonical_group_id: str
+    display_name: str
+
+
+def list_groups(contact_db: Path) -> list[GroupOption]:
+    """List current joined chatrooms without returning member/chat content."""
+    conn = _open_readonly(contact_db)
+    try:
+        rows = conn.execute(
+            """
+            SELECT username, COALESCE(NULLIF(remark, ''), NULLIF(nick_name, ''), username)
+              FROM contact
+             WHERE username LIKE '%@chatroom' AND is_in_chat_room=1
+             ORDER BY 2, username
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+    return [GroupOption(str(row[0]), str(row[1])) for row in rows]
 
 
 def _shard_id(path: Path) -> str:
@@ -196,6 +220,32 @@ def import_group_text_messages_many_with_cursors(
     if not message_dbs:
         raise ValueError("at least one message shard is required")
     group_id = resolve_group(contact_db, group_name)
+    return import_authorized_group_text_messages_many_with_cursors(
+        archive,
+        message_dbs,
+        contact_db,
+        group_id=group_id,
+        group_name=group_name,
+        after_local_ids=after_local_ids,
+        since_t=since_t,
+    )
+
+
+def import_authorized_group_text_messages_many_with_cursors(
+    archive: sqlite3.Connection,
+    message_dbs: list[Path],
+    contact_db: Path,
+    *,
+    group_id: str,
+    group_name: str,
+    after_local_ids: dict[str, int] | None = None,
+    since_t: int | None = None,
+) -> tuple[str, int, int, dict[str, int]]:
+    """Import one pre-authorized canonical chatroom across numeric shards."""
+    if not message_dbs:
+        raise ValueError("at least one message shard is required")
+    if not group_id.endswith("@chatroom"):
+        raise ValueError("authorized group id must be a canonical @chatroom id")
     with transaction(archive):
         register_group_alias(archive, group_name=group_name, canonical_id=group_id)
     after_local_ids = after_local_ids or {}

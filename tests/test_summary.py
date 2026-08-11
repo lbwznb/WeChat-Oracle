@@ -61,6 +61,9 @@ def test_ui_messages_with_unknown_sender_remain_summary_candidates() -> None:
             id INTEGER PRIMARY KEY, parent_msg_id INTEGER, t INTEGER,
             sender_display TEXT, content TEXT
         );
+        CREATE TABLE group_aliases (
+            alias_id TEXT PRIMARY KEY, canonical_group_id TEXT NOT NULL
+        );
         INSERT INTO messages
             (msg_id, group_id, group_name, t, type, content_text)
         VALUES (1, 'ui:g1', '人心黄黄', 1, 'text', '可见消息');
