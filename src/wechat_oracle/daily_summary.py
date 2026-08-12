@@ -28,6 +28,52 @@ SUMMARY_HEADERS = {
 }
 
 
+def _build_summary_member_context(
+    conn: sqlite3.Connection,
+    *,
+    group_id: str,
+    period: SummaryPeriod,
+) -> str:
+    """Load compact active-member context without making summaries fragile.
+
+    Member knowledge is an optional migration. Import and execute it lazily so
+    an older installation can continue generating raw-chat summaries. Warning
+    logs deliberately include only the exception type, never profile content.
+    """
+    try:
+        from .member_knowledge import build_active_member_context
+    except Exception as exc:  # migration not installed / import dependency
+        logger.warning(
+            "summary member context unavailable for {} ({})",
+            group_id,
+            type(exc).__name__,
+        )
+        return ""
+    try:
+        context = build_active_member_context(
+            conn,
+            group_id,
+            period.start_t,
+            period.end_t,
+            max_chars=20000,
+        )
+    except Exception as exc:
+        logger.warning(
+            "summary member context build failed for {} ({})",
+            group_id,
+            type(exc).__name__,
+        )
+        return ""
+    if not isinstance(context, str):
+        logger.warning(
+            "summary member context returned non-text for {} ({})",
+            group_id,
+            type(context).__name__,
+        )
+        return ""
+    return context.strip()[:20000]
+
+
 def split_message(text: str, max_chars: int) -> list[str]:
     """Split on paragraph/line boundaries, with a hard character fallback."""
     if max_chars <= 0:
@@ -172,11 +218,23 @@ def run_summary_group(
             )
             return "skipped"
 
+        member_context = _build_summary_member_context(
+            conn,
+            group_id=group_id,
+            period=period,
+        )
         detail_request = (
             f"{period.label} 自动群聊总结。请按实际话题分段，尽量详细地写清人物观点、"
             "事情经过、结论、分歧和待办；每个话题可用一个贴切 emoji 开头。"
             "不要添加总标题，不要使用 @，不要编造原文没有的信息。"
         )
+        detail_request += (
+            "\n[Summary grounding] The raw chat messages in the requested period are the event source and take precedence."
+            "\nMember knowledge below is background context only; do not present old profile claims or evidence as events that happened in this period."
+            " Sensitive inferences may be used only according to the user's decision."
+        )
+        if member_context:
+            detail_request += "\n\n[Active member background context — not period events]\n" + member_context
         summary = summarize_chat_hierarchical(
             llm,
             settings.llm_model,

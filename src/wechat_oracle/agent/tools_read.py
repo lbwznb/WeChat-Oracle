@@ -19,6 +19,7 @@ Conventions:
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -31,6 +32,222 @@ from .media_paths import resolve_media_path_for_msg
 from .memory import get_group_memory
 from .tools import Tool, ToolError, ToolSpec, truncate_for_llm
 from .url_reader import read_public_url
+
+
+# The member-knowledge tables are introduced by a later schema migration.  Keep
+# the read tools importable while an older database/module is still in use; a
+# call made before the migration receives a recoverable ToolError instead of
+# taking down the whole agent runtime.
+try:  # pragma: no cover - exercised by migration/packaging environments
+    from ..member_knowledge import (  # type: ignore[import-not-found]
+        get_member_profile,
+        search_member_profiles,
+    )
+except (ImportError, AttributeError):  # pragma: no cover - old installs
+    get_member_profile = None  # type: ignore[assignment,misc]
+    search_member_profiles = None  # type: ignore[assignment,misc]
+
+
+_UNKNOWN_MEMBER_NAMES = {
+    "unknown",
+    "<unknown>",
+    "(unknown)",
+    "unknown sender",
+    "__unknown__",
+    "?",
+    "?",
+}
+
+
+def _is_unknown_member_name(value: str | None) -> bool:
+    # Empty is an absent optional selector, not itself an UNKNOWN identity.
+    # Callers validate required selectors separately.
+    return bool(value) and value.strip().casefold() in _UNKNOWN_MEMBER_NAMES
+
+
+def _profile_value(profile: dict[str, Any], *keys: str, default: Any = None) -> Any:
+    """Read a profile field across compact/full member-knowledge shapes."""
+    for key in keys:
+        value = profile.get(key)
+        if value is not None:
+            return value
+    nested = profile.get("profile")
+    if isinstance(nested, dict):
+        for key in keys:
+            value = nested.get(key)
+            if value is not None:
+                return value
+    return default
+
+
+def _profile_sender_wxid(profile: dict[str, Any]) -> str:
+    value = _profile_value(profile, "sender_wxid", "wxid", "sender_id", default="")
+    return str(value or "").strip()
+
+
+def _profile_display_name(profile: dict[str, Any]) -> str:
+    value = _profile_value(
+        profile,
+        "display_name",
+        "current_display_name",
+        "sender_display",
+        "name",
+        default="",
+    )
+    name = str(value or "").strip()
+    if name:
+        return name
+    aliases = profile.get("aliases")
+    if isinstance(aliases, (list, tuple)):
+        for alias in aliases:
+            if isinstance(alias, dict):
+                alias = alias.get("alias")
+            alias_text = str(alias or "").strip()
+            if alias_text:
+                return alias_text
+    return ""
+
+
+def _profile_group_id(profile: dict[str, Any]) -> str:
+    value = _profile_value(profile, "group_id", "group", default="")
+    return str(value or "").strip()
+
+
+def _bounded_profile_value(value: Any, *, max_chars: int = 1000, depth: int = 0) -> Any:
+    """Turn arbitrary profile JSON into a small, LLM-safe JSON value."""
+    if depth > 4:
+        return "[nested value omitted]"
+    if isinstance(value, str):
+        value = value.strip()
+        return value if len(value) <= max_chars else value[: max_chars - 1] + "…"
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= 30:
+                out["…"] = "additional fields omitted"
+                break
+            out[str(key)] = _bounded_profile_value(item, max_chars=max_chars, depth=depth + 1)
+        return out
+    if isinstance(value, (list, tuple, set)):
+        values = list(value)
+        out = [
+            _bounded_profile_value(item, max_chars=max_chars, depth=depth + 1)
+            for item in values[:30]
+        ]
+        if len(values) > 30:
+            out.append("… additional items omitted")
+        return out
+    return str(value)[:max_chars]
+
+
+def _claim_payload(claim: Any) -> dict[str, Any]:
+    if not isinstance(claim, dict):
+        return {"claim_text": _bounded_profile_value(claim)}
+    evidence = _profile_value(
+        claim,
+        "evidence_msg_ids",
+        "evidence_ids",
+        "evidence",
+        default=[],
+    )
+    if not isinstance(evidence, (list, tuple, set)):
+        evidence = [evidence] if evidence not in (None, "") else []
+    basis = _bounded_profile_value(
+        _profile_value(claim, "basis", "claim_basis", default="")
+    )
+    return {
+        "claim_id": _bounded_profile_value(claim.get("claim_id")),
+        "section": _bounded_profile_value(claim.get("section")),
+        "claim_text": _bounded_profile_value(
+            _profile_value(claim, "claim_text", "text", "summary", default="")
+        ),
+        "basis": basis,
+        "claim_basis": basis,
+        "confidence": _bounded_profile_value(claim.get("confidence")),
+        "sensitive": bool(claim.get("sensitive", False)),
+        "status": _bounded_profile_value(claim.get("status")),
+        "evidence_ids": _bounded_profile_value(list(evidence), max_chars=200),
+    }
+
+
+def _profile_payload(profile: dict[str, Any], *, include_raw: bool = False) -> dict[str, Any]:
+    """Normalize one member profile for a stable, bounded tool response."""
+    claims = profile.get("claims")
+    if not isinstance(claims, list):
+        claims = []
+    claim_payloads = [_claim_payload(c) for c in claims[:30]]
+    evidence_ids: list[Any] = []
+    for claim in claim_payloads:
+        for evidence_id in claim.get("evidence_ids", []):
+            if evidence_id not in evidence_ids:
+                evidence_ids.append(evidence_id)
+    payload: dict[str, Any] = {
+        "status": "ok",
+        "sender_wxid": _bounded_profile_value(_profile_sender_wxid(profile)),
+        "display_name": _bounded_profile_value(_profile_display_name(profile)),
+        "summary": _bounded_profile_value(
+            _profile_value(profile, "summary_text", "summary", default="")
+        ),
+        "claims": claim_payloads,
+        "evidence_ids": _bounded_profile_value(evidence_ids, max_chars=200),
+        "locked_sections": _bounded_profile_value(profile.get("locked_sections", [])),
+        "version": _bounded_profile_value(profile.get("version")),
+        "updated_at": _bounded_profile_value(profile.get("updated_at")),
+    }
+    # The parsed profile document may contain useful named sections that are
+    # not represented as claims. Preserve it under an explicit section rather
+    # than flattening it into an opaque string.
+    sections = _profile_value(profile, "sections", default=None)
+    if sections is None and isinstance(profile.get("profile"), dict):
+        sections = profile.get("profile")
+    if sections is None and profile.get("profile_json") is not None:
+        encoded = profile.get("profile_json")
+        if isinstance(encoded, dict):
+            sections = encoded
+        elif isinstance(encoded, str):
+            try:
+                parsed = json.loads(encoded)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                parsed = None
+            if isinstance(parsed, dict):
+                sections = parsed
+    if sections is not None:
+        payload["sections"] = _bounded_profile_value(sections)
+    if include_raw:
+        payload["raw"] = _bounded_profile_value(profile)
+    return payload
+
+
+def _profile_json(payload: dict[str, Any], *, limit: int = 6000) -> str:
+    """Serialize a profile response while keeping tool output bounded."""
+    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
+    if len(text) <= limit:
+        return text
+    # Keep JSON valid when a profile has an unusually large parsed document.
+    compact = dict(payload)
+    compact["sections"] = "[sections omitted: profile too large]"
+    compact["claims"] = list(compact.get("claims") or [])[:8]
+    text = json.dumps(compact, ensure_ascii=False, separators=(",", ":"), default=str)
+    if len(text) <= limit:
+        return text
+    compact["claims"] = []
+    compact["summary"] = str(compact.get("summary") or "")[:1200]
+    text = json.dumps(compact, ensure_ascii=False, separators=(",", ":"), default=str)
+    if len(text) <= limit:
+        return text
+    # The identity fields and status remain useful even for a pathological
+    # profile. Keep the response valid JSON rather than slicing a JSON string.
+    minimal = {
+        "status": compact.get("status", "ok"),
+        "sender_wxid": compact.get("sender_wxid", ""),
+        "display_name": compact.get("display_name", ""),
+        "summary": str(compact.get("summary") or "")[:300],
+        "claims": [],
+        "sections": "[omitted: profile too large]",
+    }
+    return json.dumps(minimal, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
 def _fmt_t(t: int | None) -> str:
@@ -650,6 +867,183 @@ class ReadGroupMemoryTool(Tool):
         return text  # NOT truncated: the agent owns this data, gets it whole
 
 
+# --- member knowledge (read-only) -----------------------------------------
+
+
+_READ_MEMBER_PROFILE_SPEC = ToolSpec(
+    name="read_member_profile",
+    description=(
+        "Read one member's structured profile for this group. Prefer the exact "
+        "sender_wxid from context; display_name is accepted only as an exact "
+        "match. The result includes summary, profile sections, claim basis, "
+        "confidence, sensitivity/status, and evidence message IDs. Never use "
+        "UNKNOWN as a member identity."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "sender_wxid": {
+                "type": "string",
+                "description": "Exact sender wxid from a message in this group.",
+            },
+            "display_name": {
+                "type": "string",
+                "description": "Exact current display name when wxid is unavailable.",
+            },
+            "name": {
+                "type": "string",
+                "description": "Alias for an exact display-name lookup.",
+            },
+            "query": {
+                "type": "string",
+                "description": "Alias for an exact display-name lookup.",
+            },
+        },
+    },
+)
+
+
+@dataclass
+class ReadMemberProfileTool(Tool):
+    spec = _READ_MEMBER_PROFILE_SPEC
+    conn: sqlite3.Connection
+    group_id: str
+
+    def _not_found(self, *, reason: str) -> str:
+        return _profile_json({"status": "not_found", "reason": reason})
+
+    def call(self, args: dict[str, Any]) -> str:
+        sender_wxid = args.get("sender_wxid")
+        display_name = args.get("display_name")
+        name = args.get("name")
+        query = args.get("query")
+        for key, value in (("sender_wxid", sender_wxid), ("display_name", display_name), ("name", name), ("query", query)):
+            if value is not None and not isinstance(value, str):
+                raise ToolError(f"{key} must be a string")
+        sender_wxid = (sender_wxid or "").strip()
+        display_name = (display_name or name or query or "").strip()
+        selectors = [str(value).strip() for value in (display_name, name, query) if isinstance(value, str) and value.strip()]
+        if selectors and any(value != selectors[0] for value in selectors[1:]):
+            raise ToolError("display_name, name, and query must match when multiple are supplied")
+        if not sender_wxid and not display_name:
+            raise ToolError("provide sender_wxid or an exact display_name")
+        if _is_unknown_member_name(sender_wxid) or _is_unknown_member_name(display_name):
+            # UNKNOWN is an ingest placeholder, not a stable identity.  In
+            # particular, do not resolve it by fuzzy display-name search.
+            return self._not_found(reason="unknown sender identity is not personalized")
+        if get_member_profile is None or search_member_profiles is None:
+            raise ToolError("member profiles are unavailable until the member-knowledge migration is installed")
+
+        profile: dict[str, Any] | None = None
+        if sender_wxid:
+            raw = get_member_profile(self.conn, self.group_id, sender_wxid)
+            if isinstance(raw, dict):
+                profile = raw
+        else:
+            # The core search API may be fuzzy. Filter locally so a name that
+            # merely contains the query never personalizes the wrong member.
+            raw_rows = search_member_profiles(self.conn, self.group_id, display_name, limit=10)
+            exact_rows = [
+                row for row in (raw_rows or [])
+                if isinstance(row, dict)
+                and _profile_display_name(row) == display_name
+                and not _is_unknown_member_name(_profile_display_name(row))
+            ]
+            if len(exact_rows) != 1:
+                return self._not_found(
+                    reason=("ambiguous exact display name" if len(exact_rows) > 1 else "no exact display-name profile")
+                )
+            sender_wxid = _profile_sender_wxid(exact_rows[0])
+            if _is_unknown_member_name(sender_wxid):
+                return self._not_found(reason="profile has no stable sender identity")
+            raw = get_member_profile(self.conn, self.group_id, sender_wxid)
+            if isinstance(raw, dict):
+                profile = raw
+            else:
+                # Search results are compact profiles; returning the exact row
+                # is safe when the full row is not available yet.
+                profile = exact_rows[0]
+
+        if profile is None:
+            return self._not_found(reason="no profile for this member in this group")
+        profile_group_id = _profile_group_id(profile)
+        if profile_group_id and profile_group_id != self.group_id:
+            return self._not_found(reason="profile is not in this group")
+        actual_wxid = _profile_sender_wxid(profile)
+        if _is_unknown_member_name(actual_wxid):
+            return self._not_found(reason="profile has no stable sender identity")
+        if display_name:
+            actual_name = _profile_display_name(profile)
+            if actual_name and actual_name != display_name:
+                return self._not_found(reason="sender wxid and display name do not identify the same member")
+        return _profile_json(_profile_payload(profile))
+
+
+_SEARCH_MEMBER_PROFILES_SPEC = ToolSpec(
+    name="search_member_profiles",
+    description=(
+        "Search structured member profiles within this group by name, alias, "
+        "or profile text. Results are compact and include claim basis, "
+        "confidence, sensitivity/status, and evidence IDs. Use this only for "
+        "people explicitly involved in the question; never search UNKNOWN as a "
+        "person."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Name, alias, wxid, or profile text to search.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum profiles to return; defaults to 10 and is capped at 10.",
+                "minimum": 1,
+                "maximum": 10,
+            },
+        },
+        "required": ["query"],
+    },
+)
+
+
+@dataclass
+class SearchMemberProfilesTool(Tool):
+    spec = _SEARCH_MEMBER_PROFILES_SPEC
+    conn: sqlite3.Connection
+    group_id: str
+
+    def call(self, args: dict[str, Any]) -> str:
+        query = args.get("query")
+        if not isinstance(query, str) or not query.strip():
+            raise ToolError("query must be a non-empty string")
+        query = query.strip()
+        if _is_unknown_member_name(query):
+            return _profile_json({"status": "ok", "profiles": []})
+        limit = args.get("limit", 10)
+        if not isinstance(limit, int) or limit < 1:
+            limit = 10
+        limit = min(limit, 10)
+        if search_member_profiles is None:
+            raise ToolError("member profiles are unavailable until the member-knowledge migration is installed")
+        rows = search_member_profiles(self.conn, self.group_id, query, limit=limit) or []
+        profiles: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row_group_id = _profile_group_id(row)
+            row_wxid = _profile_sender_wxid(row)
+            row_name = _profile_display_name(row)
+            if row_group_id and row_group_id != self.group_id:
+                continue
+            if _is_unknown_member_name(row_wxid) or _is_unknown_member_name(row_name):
+                continue
+            profiles.append(_profile_payload(row))
+            if len(profiles) >= limit:
+                break
+        return _profile_json({"status": "ok", "query": query, "profiles": profiles})
+
+
 # --- read_url --------------------------------------------------------------
 
 
@@ -981,6 +1375,8 @@ def register_phase_a_tools(
     tools.register(ViewQuotedChainTool(conn=tools.conn, group_id=tools.group_id))
     tools.register(ExpandForwardBundleTool(conn=tools.conn, group_id=tools.group_id))
     tools.register(ReadGroupMemoryTool(conn=tools.conn, group_id=tools.group_id))
+    tools.register(ReadMemberProfileTool(conn=tools.conn, group_id=tools.group_id))
+    tools.register(SearchMemberProfilesTool(conn=tools.conn, group_id=tools.group_id))
     tools.register(ReadUrlTool())
     tools.register(ReadImageTool(
         conn=tools.conn, group_id=tools.group_id,

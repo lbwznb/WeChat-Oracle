@@ -39,6 +39,11 @@ AGENT_CONFIG_KEYS = (
     "WO_RAW_WECHAT_ACCOUNT",
     "WO_HOURLY_SUMMARY_ENABLED",
     "WO_DAILY_SUMMARY_ENABLED",
+    "WO_MEMBER_KB_ENABLED",
+    "WO_MEMBER_KB_INTERVAL_SECONDS",
+    "WO_MEMBER_KB_CHUNK_CHARS",
+    "WO_MEMBER_KB_MAX_CONCURRENCY",
+    "WO_MEMBER_KB_RETRIES",
     "WO_OPENCLAW_AGENT_ID",
 )
 
@@ -67,6 +72,11 @@ class AgentRuntimeConfig:
     raw_wechat_account: str = ""
     hourly_summary_enabled: bool = False
     daily_summary_enabled: bool = False
+    member_kb_enabled: bool = False
+    member_kb_interval_seconds: int = 3600
+    member_kb_chunk_chars: int = 24_000
+    member_kb_max_concurrency: int = 2
+    member_kb_retries: int = 3
 
     def env_updates(self) -> dict[str, str]:
         available_names = dict(self.available_groups)
@@ -89,6 +99,11 @@ class AgentRuntimeConfig:
             "WO_RAW_WECHAT_ACCOUNT": self.raw_wechat_account,
             "WO_HOURLY_SUMMARY_ENABLED": "true" if self.hourly_summary_enabled else "false",
             "WO_DAILY_SUMMARY_ENABLED": "true" if self.daily_summary_enabled else "false",
+            "WO_MEMBER_KB_ENABLED": "true" if self.member_kb_enabled else "false",
+            "WO_MEMBER_KB_INTERVAL_SECONDS": str(self.member_kb_interval_seconds),
+            "WO_MEMBER_KB_CHUNK_CHARS": str(self.member_kb_chunk_chars),
+            "WO_MEMBER_KB_MAX_CONCURRENCY": str(self.member_kb_max_concurrency),
+            "WO_MEMBER_KB_RETRIES": str(self.member_kb_retries),
             "WO_OPENCLAW_AGENT_ID": self.openclaw_agent_id,
         }
 
@@ -126,6 +141,11 @@ def load_agent_runtime_config() -> AgentRuntimeConfig:
         raw_wechat_account=current.raw_wechat_account,
         hourly_summary_enabled=current.hourly_summary_enabled,
         daily_summary_enabled=current.daily_summary_enabled,
+        member_kb_enabled=current.member_kb_enabled,
+        member_kb_interval_seconds=current.member_kb_interval_seconds,
+        member_kb_chunk_chars=current.member_kb_chunk_chars,
+        member_kb_max_concurrency=current.member_kb_max_concurrency,
+        member_kb_retries=current.member_kb_retries,
     )
 
 
@@ -150,6 +170,10 @@ def _validated_updates(config: AgentRuntimeConfig) -> dict[str, str]:
     continuation_max = int(config.continuation_max_followups)
     continuation_delay = int(config.continuation_delay_seconds)
     continuation_ttl = int(config.continuation_ttl_seconds)
+    member_kb_interval = int(config.member_kb_interval_seconds)
+    member_kb_chunk_chars = int(config.member_kb_chunk_chars)
+    member_kb_concurrency = int(config.member_kb_max_concurrency)
+    member_kb_retries = int(config.member_kb_retries)
     groups = tuple(dict.fromkeys(item.strip() for item in config.groups if item.strip()))
     if backend not in {"native", "openclaw", "pi"}:
         raise ValueError("后端只能是 native、openclaw 或 pi")
@@ -165,6 +189,14 @@ def _validated_updates(config: AgentRuntimeConfig) -> dict[str, str]:
         raise ValueError("continuation delay must be >= 5 seconds")
     if continuation_ttl < continuation_delay:
         raise ValueError("continuation TTL must be >= delay")
+    if member_kb_interval < 300:
+        raise ValueError("member knowledge interval must be at least 300 seconds")
+    if not 4_000 <= member_kb_chunk_chars <= 200_000:
+        raise ValueError("member knowledge chunk chars must be between 4000 and 200000")
+    if not 1 <= member_kb_concurrency <= 2:
+        raise ValueError("member knowledge concurrency must be between 1 and 2")
+    if not 1 <= member_kb_retries <= 3:
+        raise ValueError("member knowledge retries must be between 1 and 3")
     if not llm_model:
         raise ValueError("Native 模型不能为空")
     parsed_endpoint = urlparse(llm_endpoint)
@@ -198,6 +230,11 @@ def _validated_updates(config: AgentRuntimeConfig) -> dict[str, str]:
         "WO_RAW_WECHAT_ACCOUNT": config.raw_wechat_account.strip().lower(),
         "WO_HOURLY_SUMMARY_ENABLED": "true" if config.hourly_summary_enabled else "false",
         "WO_DAILY_SUMMARY_ENABLED": "true" if config.daily_summary_enabled else "false",
+        "WO_MEMBER_KB_ENABLED": "true" if config.member_kb_enabled else "false",
+        "WO_MEMBER_KB_INTERVAL_SECONDS": str(member_kb_interval),
+        "WO_MEMBER_KB_CHUNK_CHARS": str(member_kb_chunk_chars),
+        "WO_MEMBER_KB_MAX_CONCURRENCY": str(member_kb_concurrency),
+        "WO_MEMBER_KB_RETRIES": str(member_kb_retries),
         "WO_OPENCLAW_AGENT_ID": openclaw_agent_id,
     }
     if config.llm_api_key_update is not None:

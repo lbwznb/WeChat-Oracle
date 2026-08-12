@@ -216,6 +216,7 @@ PHASE_A_OPS_RULES = (
     " 不要用 follow-up 拖延简单问题，能当场答就当场答。follow-up 只保存 intent，到期会重新读上下文再决定。\n"
     "\n"
     + READ_IMAGE_OCR_FALLBACK
+    + "\n\nMember profiles: when the requester is an identifiable group member (not UNKNOWN and not the local operator), call read_member_profile for that requester by default before answering. Read or search profiles for other people only when they are explicitly involved in the user's question. Never use UNKNOWN as a member identity or personalize a response from an UNKNOWN sender. Profile claims are background evidence; do not present old claims as events from the current chat."
 )
 
 # Default identity sentence when persona yaml has no identity field.
@@ -323,6 +324,7 @@ PHASE_B_USER = (
 
 # Appended to PHASE_B_SYSTEM to specialize the instructions for lurk.
 LURK_SYSTEM_ADDENDUM = (
+    "\nMember profiles are read-only background context. Read a requester profile only when the requester is identifiable; search/read profiles for other people only when they are explicitly involved in the observed discussion. Never personalize UNKNOWN."
     "\n\n当前是 lurk 后台学习，不是群聊回复。你永远不会发消息到群里。"
     "输入是一批新观察到的群消息；如果这些消息暗示了旧上下文，"
     "可以调用 search_group_messages / get_message_context / view_quoted_chain / expand_forward_bundle 查看老消息。"

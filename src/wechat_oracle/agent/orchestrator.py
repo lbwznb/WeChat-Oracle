@@ -56,7 +56,9 @@ from .tools_control import register_phase_a_control_tools
 from .tools_read import (
     ExpandForwardBundleTool,
     GetMessageContextTool,
+    ReadMemberProfileTool,
     SearchGroupMessagesTool,
+    SearchMemberProfilesTool,
     ViewQuotedChainTool,
     register_phase_a_tools,
 )
@@ -625,6 +627,8 @@ def chat_via_lurk(
     lurk_tools.register(GetMessageContextTool(conn=conn, group_id=group_id))
     lurk_tools.register(ViewQuotedChainTool(conn=conn, group_id=group_id))
     lurk_tools.register(ExpandForwardBundleTool(conn=conn, group_id=group_id))
+    lurk_tools.register(ReadMemberProfileTool(conn=conn, group_id=group_id))
+    lurk_tools.register(SearchMemberProfilesTool(conn=conn, group_id=group_id))
     register_phase_b_tools(lurk_tools)
 
     phase_b_trace = run_lurk_reflection(

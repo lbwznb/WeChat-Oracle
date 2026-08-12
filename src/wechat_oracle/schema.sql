@@ -28,6 +28,11 @@ CREATE INDEX IF NOT EXISTS idx_messages_group_t       ON messages (group_id, t);
 CREATE INDEX IF NOT EXISTS idx_messages_status        ON messages (status);
 CREATE INDEX IF NOT EXISTS idx_messages_sender        ON messages (sender_wxid);
 CREATE INDEX IF NOT EXISTS idx_messages_wx_msg_id     ON messages (wx_msg_id);
+-- Member-knowledge reads always scope by group + normalized sender and then
+-- walk the immutable message id cursor.  Keep the raw sender value unchanged;
+-- NULL/blank values are normalized to __unknown__ by the knowledge layer.
+CREATE INDEX IF NOT EXISTS idx_messages_group_sender_msg
+    ON messages (group_id, sender_wxid, msg_id);
 
 -- Maps display-name-derived UI ids onto a verified real @chatroom id. This
 -- keeps raw history, UI live events, dispatcher context, and daily summaries
@@ -256,10 +261,114 @@ CREATE TABLE IF NOT EXISTS group_notes (
     updated_at   REAL
 );
 
+-- ---------- Per-group member knowledge -----------------------------------
+-- These tables are additive derived state.  messages remains the only raw
+-- message store and is never copied into a member-specific table.
+CREATE TABLE IF NOT EXISTS member_profiles (
+    group_id             TEXT NOT NULL,
+    sender_wxid          TEXT NOT NULL,
+    display_name         TEXT,
+    profile_json         TEXT NOT NULL DEFAULT '{}',
+    summary_text         TEXT NOT NULL DEFAULT '',
+    locked_sections_json TEXT NOT NULL DEFAULT '[]',
+    version              INTEGER NOT NULL DEFAULT 1,
+    created_at           REAL NOT NULL,
+    updated_at           REAL NOT NULL,
+    deleted_at           REAL,
+    PRIMARY KEY (group_id, sender_wxid)
+);
+CREATE INDEX IF NOT EXISTS idx_member_profiles_group
+    ON member_profiles(group_id, updated_at);
+
+CREATE TABLE IF NOT EXISTS member_alias_history (
+    group_id      TEXT NOT NULL,
+    sender_wxid   TEXT NOT NULL,
+    alias         TEXT NOT NULL,
+    first_seen_at REAL NOT NULL,
+    last_seen_at  REAL NOT NULL,
+    seen_count    INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (group_id, sender_wxid, alias)
+);
+CREATE INDEX IF NOT EXISTS idx_member_alias_history_lookup
+    ON member_alias_history(group_id, alias);
+
+CREATE TABLE IF NOT EXISTS member_claims (
+    claim_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id      TEXT NOT NULL,
+    sender_wxid   TEXT NOT NULL,
+    section       TEXT NOT NULL CHECK(section IN (
+        'identity','interests','skills','communication_style','habits',
+        'relationships','opinions','sensitive_inferences','recent_focus'
+    )),
+    claim_text    TEXT NOT NULL,
+    basis         TEXT NOT NULL CHECK(basis IN ('self_reported','observed','inferred')),
+    confidence    REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+    sensitive     INTEGER NOT NULL DEFAULT 0 CHECK(sensitive IN (0,1)),
+    status        TEXT NOT NULL DEFAULT 'current'
+                  CHECK(status IN ('current','superseded','deleted')),
+    superseded_by INTEGER,
+    created_at    REAL NOT NULL,
+    updated_at    REAL NOT NULL,
+    FOREIGN KEY (group_id, sender_wxid)
+        REFERENCES member_profiles(group_id, sender_wxid) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_member_claims_member_status
+    ON member_claims(group_id, sender_wxid, status, section);
+
+CREATE TABLE IF NOT EXISTS member_claim_evidence (
+    evidence_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    claim_id   INTEGER NOT NULL,
+    group_id   TEXT NOT NULL,
+    sender_wxid TEXT NOT NULL,
+    msg_id     INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    UNIQUE (claim_id, msg_id),
+    FOREIGN KEY (claim_id) REFERENCES member_claims(claim_id) ON DELETE CASCADE,
+    FOREIGN KEY (msg_id) REFERENCES messages(msg_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_member_claim_evidence_msg
+    ON member_claim_evidence(group_id, sender_wxid, msg_id);
+
+CREATE TABLE IF NOT EXISTS member_update_state (
+    group_id              TEXT NOT NULL,
+    sender_wxid           TEXT NOT NULL,
+    cursor_msg_id         INTEGER NOT NULL DEFAULT 0,
+    cursor_t              INTEGER,
+    full_history_complete INTEGER NOT NULL DEFAULT 0 CHECK(full_history_complete IN (0,1)),
+    last_status           TEXT NOT NULL DEFAULT 'idle',
+    last_error            TEXT,
+    last_run_id           INTEGER,
+    updated_at            REAL NOT NULL,
+    PRIMARY KEY (group_id, sender_wxid),
+    FOREIGN KEY (group_id, sender_wxid)
+        REFERENCES member_profiles(group_id, sender_wxid) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_member_update_state_due
+    ON member_update_state(group_id, updated_at);
+
+CREATE TABLE IF NOT EXISTS member_update_runs (
+    run_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id      TEXT NOT NULL,
+    sender_wxid   TEXT NOT NULL,
+    mode          TEXT NOT NULL CHECK(mode IN ('full','incremental','manual')),
+    status        TEXT NOT NULL CHECK(status IN ('running','succeeded','failed','skipped')),
+    cursor_before INTEGER,
+    cursor_after  INTEGER,
+    chunk_count   INTEGER NOT NULL DEFAULT 0,
+    message_count INTEGER NOT NULL DEFAULT 0,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    error_text    TEXT,
+    started_at    REAL NOT NULL,
+    finished_at   REAL,
+    details_json  TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_member_update_runs_member
+    ON member_update_runs(group_id, sender_wxid, started_at);
+
 -- Schema version, for future migrations. Bumped manually when DDL changes.
 CREATE TABLE IF NOT EXISTS schema_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
-INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('version', '4');
-UPDATE schema_meta SET value = '4' WHERE key = 'version';
+INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('version', '5');
+UPDATE schema_meta SET value = '5' WHERE key = 'version';

@@ -233,6 +233,341 @@ class MemoryEditorScreen(ModalScreen[MemoryEditResult | None]):
         )
 
 
+class MemberKnowledgeConsentScreen(ModalScreen[bool]):
+    """Explicit consent gate before archived chat is sent to the profile LLM."""
+
+    BINDINGS = [("escape", "cancel", "取消")]
+
+    def __init__(self, *, message_count: int, member_count: int, estimated_calls: int) -> None:
+        super().__init__()
+        self._message_count = message_count
+        self._member_count = member_count
+        self._estimated_calls = estimated_calls
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="config-value-editor"):
+            yield Static("启用成员知识库", id="config-value-title")
+            yield Static(
+                "启用后会把已选群的历史发言和派生画像发送给当前配置的 "
+                "OpenAI-compatible API。模型可推断敏感属性，这些画像可能用于群回复和总结。\n\n"
+                f"待处理约 {self._message_count} 条消息、{self._member_count} 位成员，"
+                f"预计至少 {self._estimated_calls} 次模型调用。",
+                id="config-value-help",
+            )
+            with Horizontal(id="config-value-buttons"):
+                yield Button("我理解并启用", id="member-kb-consent-confirm", variant="error")
+                yield Button("取消", id="member-kb-consent-cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "member-kb-consent-confirm":
+            self.dismiss(True)
+        else:
+            self.dismiss(False)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
+@dataclass(frozen=True)
+class MemberSectionEditResult:
+    section: str
+    content: str
+    locked: bool
+
+
+class MemberSectionEditorScreen(ModalScreen[MemberSectionEditResult | None]):
+    BINDINGS = [("ctrl+s", "save", "保存"), ("escape", "cancel", "取消")]
+
+    def __init__(self, *, section: str, content: str, locked: bool) -> None:
+        super().__init__()
+        self._section = section
+        self._locked = locked
+        self._content = content
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="memory-editor"):
+            yield Static(f"编辑成员画像栏目：{self._section}", id="memory-editor-title")
+            yield Static(
+                "手工锁定后，定时画像模型不能覆盖此栏目。",
+                id="memory-editor-meta",
+            )
+            yield MemoryTextArea(self._content, id="member-section-text")
+            with Horizontal(id="memory-editor-actions"):
+                yield Button(
+                    f"锁定：{'是' if self._locked else '否'}",
+                    id="member-section-lock",
+                )
+                yield Button("保存", id="member-section-save", variant="primary")
+                yield Button("取消", id="member-section-cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "member-section-lock":
+            self._locked = not self._locked
+            event.button.label = f"锁定：{'是' if self._locked else '否'}"
+        elif event.button.id == "member-section-save":
+            self.action_save()
+        else:
+            self.action_cancel()
+
+    def action_save(self) -> None:
+        self.dismiss(
+            MemberSectionEditResult(
+                section=self._section,
+                content=self.query_one("#member-section-text", TextArea).text,
+                locked=self._locked,
+            )
+        )
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class MemberKnowledgeActionConfirmScreen(ModalScreen[bool]):
+    def __init__(self, *, title: str, body: str) -> None:
+        super().__init__()
+        self._title = title
+        self._body = body
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="config-value-editor"):
+            yield Static(self._title, id="config-value-title")
+            yield Static(self._body, id="config-value-help")
+            with Horizontal(id="config-value-buttons"):
+                yield Button("确认", id="member-action-confirm", variant="error")
+                yield Button("取消", id="member-action-cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "member-action-confirm")
+
+
+class MemberKnowledgeScreen(ModalScreen[None]):
+    """Local browser/editor for one group's evidence-linked member profiles."""
+
+    BINDINGS = [("escape", "close", "关闭")]
+
+    def __init__(self, group: LocalAskGroup) -> None:
+        super().__init__()
+        self._group = group
+        self._members: list[dict] = []
+        self._selected: dict | None = None
+        self._profile: dict = {}
+        self._section_index = 0
+        self._sections = (
+            "identity", "interests", "skills", "communication_style", "habits",
+            "relationships", "opinions", "sensitive_inferences", "recent_focus",
+        )
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="memory-editor"):
+            yield Static(f"成员知识库 · {self._group.label}", id="memory-editor-title")
+            yield Static(
+                "⚠ 群聊原文与画像会发送给配置的模型 API；敏感推断可能进入群回复和总结。",
+                id="memory-editor-meta",
+            )
+            with Horizontal():
+                yield ListView(id="member-kb-members")
+                yield RichLog(id="member-kb-detail", wrap=True, highlight=False, markup=False)
+            with Horizontal(id="memory-editor-actions"):
+                yield Button("编辑栏目", id="member-kb-edit")
+                yield Button("切换栏目", id="member-kb-next-section")
+                yield Button("删除画像", id="member-kb-delete", variant="error")
+                yield Button("完整重建", id="member-kb-rebuild")
+                yield Button("刷新", id="member-kb-refresh")
+                yield Button("关闭", id="member-kb-close")
+
+    def on_mount(self) -> None:
+        self._reload_members()
+
+    def _reload_members(self) -> None:
+        from .member_knowledge import list_member_profiles
+
+        try:
+            with get_conn() as conn:
+                self._members = list_member_profiles(conn, self._group.group_id)
+        except Exception as exc:
+            self.query_one("#member-kb-detail", RichLog).write(
+                f"读取成员知识库失败：{type(exc).__name__}: {exc}"
+            )
+            return
+        view = self.query_one("#member-kb-members", ListView)
+        view.clear()
+        for index, item in enumerate(self._members):
+            name = item.get("display_name") or item.get("current_display_name") or item.get("sender_wxid") or "未知成员"
+            count = item.get("message_count", 0)
+            view.append(ListItem(Label(f"{name}  ·  {count} 条"), id=f"member-kb-row-{index}"))
+        if self._members:
+            self._select_member(0)
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        item_id = event.item.id or ""
+        if item_id.startswith("member-kb-row-"):
+            self._select_member(int(item_id.rsplit("-", 1)[1]))
+
+    def _select_member(self, index: int) -> None:
+        if not 0 <= index < len(self._members):
+            return
+        from .member_knowledge import get_member_profile, list_member_messages
+
+        self._selected = self._members[index]
+        sender = str(self._selected.get("sender_wxid") or "")
+        try:
+            with get_conn() as conn:
+                self._profile = get_member_profile(conn, self._group.group_id, sender) or {}
+                messages = list_member_messages(
+                    conn, self._group.group_id, sender, limit=50
+                )
+        except Exception as exc:
+            self.query_one("#member-kb-detail", RichLog).write(
+                f"读取画像失败：{type(exc).__name__}: {exc}"
+            )
+            return
+        self._render_detail(messages)
+
+    def _profile_sections(self) -> dict:
+        value = self._profile.get("profile") or self._profile.get("profile_json") or {}
+        if isinstance(value, str):
+            import json as _json
+            try:
+                value = _json.loads(value)
+            except Exception:
+                value = {}
+        return value if isinstance(value, dict) else {}
+
+    def _render_detail(self, messages: list[dict]) -> None:
+        import json as _json
+
+        log = self.query_one("#member-kb-detail", RichLog)
+        log.clear()
+        aliases = self._profile.get("aliases") or []
+        locked = set(self._profile.get("locked_sections") or [])
+        log.write(f"成员：{self._profile.get('display_name') or self._profile.get('current_display_name') or self._profile.get('sender_wxid')}")
+        log.write(f"wxid：{self._profile.get('sender_wxid')}  昵称历史：{', '.join(map(str, aliases)) or '-'}")
+        log.write(f"总画像：{self._profile.get('summary_text') or '(尚未生成)'}")
+        log.write("\n结构化画像：")
+        for section in self._sections:
+            marker = " [已锁定]" if section in locked else ""
+            value = self._profile_sections().get(section, "")
+            log.write(f"- {section}{marker}: {value or '-'}")
+        log.write("\n结论与证据：")
+        for claim in self._profile.get("claims") or []:
+            text = claim.get("claim_text") or claim.get("text") or ""
+            evidence = claim.get("evidence_msg_ids") or claim.get("evidence") or []
+            log.write(
+                f"- [{claim.get('status','current')}] {text} · {claim.get('basis','?')} "
+                f"· confidence={claim.get('confidence','?')} · sensitive={bool(claim.get('sensitive'))} "
+                f"· evidence={_json.dumps(evidence, ensure_ascii=False)}"
+            )
+        log.write("\n最近原始消息（本地读取）：")
+        for message in messages:
+            body = message.get("content_text") or message.get("transcript") or ""
+            log.write(f"#{message.get('msg_id')} {message.get('t')}  {body}")
+
+    def _write_detail(self, text: str) -> None:
+        self.query_one("#member-kb-detail", RichLog).write(text)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        match event.button.id:
+            case "member-kb-close":
+                self.dismiss(None)
+            case "member-kb-refresh":
+                self._reload_members()
+            case "member-kb-next-section":
+                self._section_index = (self._section_index + 1) % len(self._sections)
+                event.button.label = f"栏目：{self._sections[self._section_index]}"
+            case "member-kb-edit":
+                self._edit_section()
+            case "member-kb-delete":
+                if self._selected:
+                    self.app.push_screen(
+                        MemberKnowledgeActionConfirmScreen(
+                            title="删除派生画像",
+                            body="只删除画像、结论和更新游标；原始群聊消息永久保留。",
+                        ),
+                        self._on_delete_confirmed,
+                    )
+            case "member-kb-rebuild":
+                if self._selected:
+                    self.app.push_screen(
+                        MemberKnowledgeActionConfirmScreen(
+                            title="完整历史重建",
+                            body="将清除派生画像并重新把该成员全部历史发言发送给模型 API。",
+                        ),
+                        self._on_rebuild_confirmed,
+                    )
+
+    def _edit_section(self) -> None:
+        if not self._selected:
+            return
+        section = self._sections[self._section_index]
+        self.app.push_screen(
+            MemberSectionEditorScreen(
+                section=section,
+                content=str(self._profile_sections().get(section) or ""),
+                locked=section in set(self._profile.get("locked_sections") or []),
+            ),
+            self._on_section_edited,
+        )
+
+    def _on_section_edited(self, result: MemberSectionEditResult | None) -> None:
+        if result is None or not self._selected:
+            return
+        from .member_knowledge import update_member_profile_section
+
+        sender = str(self._selected.get("sender_wxid") or "")
+        with get_conn() as conn:
+            update_member_profile_section(
+                conn, self._group.group_id, sender,
+                result.section, result.content, locked=result.locked,
+            )
+        self._reload_members()
+
+    def _on_delete_confirmed(self, accepted: bool) -> None:
+        if not accepted or not self._selected:
+            return
+        from .member_knowledge import delete_member_profile
+
+        sender = str(self._selected.get("sender_wxid") or "")
+        with get_conn() as conn:
+            delete_member_profile(conn, self._group.group_id, sender, keep_messages=True)
+        self._reload_members()
+
+    def _on_rebuild_confirmed(self, accepted: bool) -> None:
+        if not accepted or not self._selected:
+            return
+        sender = str(self._selected.get("sender_wxid") or "")
+        self.query_one("#member-kb-detail", RichLog).write("重建任务已启动……")
+
+        def worker() -> None:
+            from .llm import build_llm_client
+            from .member_knowledge import reset_member_profile, run_member_update
+
+            try:
+                with get_conn() as conn:
+                    reset_member_profile(conn, self._group.group_id, sender)
+                    llm = build_llm_client(
+                        provider=settings.llm_provider,
+                        api_key=settings.llm_api_key,
+                        endpoint=settings.llm_endpoint,
+                        json_mode=settings.llm_json_mode,
+                    )
+                    run_member_update(
+                        conn, self._group.group_id, sender, llm,
+                        chunk_chars=settings.member_kb_chunk_chars,
+                        retries=settings.member_kb_retries,
+                    )
+                self.app.call_from_thread(self._reload_members)
+            except Exception as exc:
+                self.app.call_from_thread(
+                    self._write_detail,
+                    f"重建失败：{type(exc).__name__}",
+                )
+
+        threading.Thread(target=worker, daemon=True, name="member-kb-rebuild").start()
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 class ConfigValueScreen(ModalScreen[str | None]):
     """Edit one config value in a small, focused dialog."""
 
@@ -650,6 +985,7 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
         self._raw_wechat_account = config.raw_wechat_account
         self._hourly_summary_enabled = bool(config.hourly_summary_enabled)
         self._daily_summary_enabled = bool(config.daily_summary_enabled)
+        self._member_kb_enabled = bool(config.member_kb_enabled)
         self._openclaw_agent_id = config.openclaw_agent_id
 
     def compose(self) -> ComposeResult:
@@ -669,6 +1005,12 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
             yield Button("", id="config-menu-raw-account", classes="config-menu-item", compact=True)
             yield Button("", id="config-menu-hourly-summary", classes="config-menu-item", compact=True)
             yield Button("", id="config-menu-daily-summary", classes="config-menu-item", compact=True)
+            yield Button("", id="config-menu-member-kb", classes="config-menu-item", compact=True)
+            yield Static(
+                "隐私提示：成员知识库会把群聊原文和画像发送给已配置的模型 API；"
+                "敏感推断可能用于群回复和总结。",
+                id="config-member-kb-warning",
+            )
             yield Button("", id="config-menu-proactive-mode", classes="config-menu-item", compact=True)
             yield Button("", id="config-menu-probability", classes="config-menu-item", compact=True)
             yield Button("", id="config-menu-mention-policy", classes="config-menu-item", compact=True)
@@ -741,6 +1083,21 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
                 self._daily_summary_enabled = not self._daily_summary_enabled
                 self._refresh_menu()
                 self._mark_dirty()
+            case "config-menu-member-kb":
+                if self._member_kb_enabled:
+                    self._member_kb_enabled = False
+                    self._refresh_menu()
+                    self._mark_dirty()
+                else:
+                    message_count, member_count, estimated_calls = self._member_kb_estimate()
+                    self.app.push_screen(
+                        MemberKnowledgeConsentScreen(
+                            message_count=message_count,
+                            member_count=member_count,
+                            estimated_calls=estimated_calls,
+                        ),
+                        self._on_member_kb_consent,
+                    )
             case "config-menu-proactive-mode":
                 self.app.push_screen(
                     ConfigProactiveModeScreen(self._proactive_mode),
@@ -843,6 +1200,11 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
                 raw_wechat_account=self._raw_wechat_account,
                 hourly_summary_enabled=self._hourly_summary_enabled,
                 daily_summary_enabled=self._daily_summary_enabled,
+                member_kb_enabled=self._member_kb_enabled,
+                member_kb_interval_seconds=self._config.member_kb_interval_seconds,
+                member_kb_chunk_chars=self._config.member_kb_chunk_chars,
+                member_kb_max_concurrency=self._config.member_kb_max_concurrency,
+                member_kb_retries=self._config.member_kb_retries,
             )
         )
 
@@ -939,6 +1301,41 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
             self._refresh_menu()
             self._mark_dirty()
 
+    def _on_member_kb_consent(self, accepted: bool) -> None:
+        if not accepted:
+            return
+        self._member_kb_enabled = True
+        self._refresh_menu()
+        self._mark_dirty()
+
+    def _member_kb_estimate(self) -> tuple[int, int, int]:
+        if not self._groups:
+            return (0, 0, 0)
+        names = dict(self._config.available_groups)
+        selectors = tuple(dict.fromkeys([*self._groups, *(names.get(item, item) for item in self._groups)]))
+        placeholders = ",".join("?" for _ in selectors)
+        try:
+            with get_conn() as conn:
+                row = conn.execute(
+                    f"""
+                    SELECT COUNT(*) AS message_count,
+                           COUNT(DISTINCT group_id || char(31) ||
+                               COALESCE(NULLIF(TRIM(sender_wxid), ''), '__unknown__')) AS member_count,
+                           COALESCE(SUM(LENGTH(COALESCE(content_text, '')) +
+                                        LENGTH(COALESCE(transcript, ''))), 0) AS content_chars
+                      FROM messages
+                     WHERE group_id IN ({placeholders}) OR group_name IN ({placeholders})
+                    """,
+                    [*selectors, *selectors],
+                ).fetchone()
+        except Exception:
+            return (0, 0, 0)
+        message_count = int(row["message_count"] or 0)
+        member_count = int(row["member_count"] or 0)
+        content_chars = int(row["content_chars"] or 0)
+        chunks = (content_chars + self._config.member_kb_chunk_chars - 1) // self._config.member_kb_chunk_chars
+        return (message_count, member_count, max(member_count, chunks) if message_count else 0)
+
     def _on_openclaw_agent_changed(self, value: str | None) -> None:
         if value is not None:
             self._openclaw_agent_id = value
@@ -970,6 +1367,9 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
         )
         self.query_one("#config-menu-daily-summary", Button).label = (
             f"午夜每日总结　{'on' if self._daily_summary_enabled else 'off'}"
+        )
+        self.query_one("#config-menu-member-kb", Button).label = (
+            f"成员知识库　{'on' if self._member_kb_enabled else 'off'}"
         )
         self.query_one("#config-menu-proactive-mode", Button).label = (
             f"主动模式　{_proactive_mode_label(self._proactive_mode)}"
@@ -1008,6 +1408,7 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
             self.query_one("#config-menu-raw-account", Button),
             self.query_one("#config-menu-hourly-summary", Button),
             self.query_one("#config-menu-daily-summary", Button),
+            self.query_one("#config-menu-member-kb", Button),
             self.query_one("#config-menu-proactive-mode", Button),
             self.query_one("#config-menu-probability", Button),
             self.query_one("#config-menu-mention-policy", Button),
@@ -1294,6 +1695,7 @@ class RunDashboard(App[None]):
         ("a", "ask_selected_group", "询问"),
         ("g", "select_group", "选群"),
         ("m", "edit_memory", "记忆"),
+        ("k", "member_knowledge", "成员库"),
         ("c", "edit_config", "配置"),
         ("w", "toggle_write_mode", "写入"),
         ("q", "quit", "退出"),
@@ -1393,6 +1795,14 @@ class RunDashboard(App[None]):
             ),
             self._on_memory_editor_saved,
         )
+
+    def action_member_knowledge(self) -> None:
+        if self._selected_group is None:
+            self._select_default_group()
+        if self._selected_group is None:
+            self._append_local("请先按 g 选择群")
+            return
+        self.push_screen(MemberKnowledgeScreen(self._selected_group))
 
     def action_edit_config(self) -> None:
         try:
@@ -1610,6 +2020,7 @@ def status_lines_for_processes(
     bot_label = settings.bot_name or "unset"
     reply_label = _tag(settings.reply_backend, _OK_STYLE) if settings.reply else _tag("off", _MUTED_STYLE)
     lurk_label = _tag("on", _OK_STYLE) if settings.agent_lurk_enabled else _tag("off", _MUTED_STYLE)
+    member_kb_label = _tag("on", _WARN_STYLE) if agent_config.member_kb_enabled else _tag("off", _MUTED_STYLE)
     stance_label = _proactive_status_label(agent_config.proactive_mode)
     wake_label = _wake_status_label(
         agent_config.agent_base_probability, agent_config.proactive_mode
@@ -1626,7 +2037,7 @@ def status_lines_for_processes(
         ),
         _status_row(
             "AMBIENT",
-            f"stance {stance_label} {_SEP} wake {wake_label} {_SEP} cont {continuation_label} {_SEP} lurk {lurk_label}",
+            f"stance {stance_label} {_SEP} wake {wake_label} {_SEP} cont {continuation_label} {_SEP} lurk {lurk_label} {_SEP} member-kb {member_kb_label}",
         ),
         _status_row(
             "WATCH",

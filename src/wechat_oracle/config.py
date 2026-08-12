@@ -93,6 +93,15 @@ class Settings(BaseSettings):
     summary_generation_lease_seconds: int = 900
     summary_sending_lease_seconds: int = 300
 
+    # Per-group member knowledge. Raw messages remain in `messages`; this
+    # scheduler maintains evidence-linked profiles for each stable sender id.
+    # It is opt-in because message/profile text is sent to the configured LLM.
+    member_kb_enabled: bool = False
+    member_kb_interval_seconds: int = 3600
+    member_kb_chunk_chars: int = 24_000
+    member_kb_max_concurrency: int = 2
+    member_kb_retries: int = 3
+
     # LLM output caps. `llm_max_tokens` is the fallback; specialized values let
     # long-context chat/summaries breathe while keeping short utility commands cheap.
     # Memory-write paths (Phase B / lurk) need their own bigger budget because the
@@ -316,6 +325,34 @@ class Settings(BaseSettings):
     def _validate_summary_seconds(cls, v: int) -> int:
         if v < 0:
             raise ValueError("summary timing values must be non-negative")
+        return v
+
+    @field_validator("member_kb_interval_seconds")
+    @classmethod
+    def _validate_member_kb_interval(cls, v: int) -> int:
+        if v < 300:
+            raise ValueError("WO_MEMBER_KB_INTERVAL_SECONDS must be at least 300")
+        return v
+
+    @field_validator("member_kb_chunk_chars")
+    @classmethod
+    def _validate_member_kb_chunk_chars(cls, v: int) -> int:
+        if not 4_000 <= v <= 200_000:
+            raise ValueError("WO_MEMBER_KB_CHUNK_CHARS must be between 4000 and 200000")
+        return v
+
+    @field_validator("member_kb_max_concurrency")
+    @classmethod
+    def _validate_member_kb_concurrency(cls, v: int) -> int:
+        if not 1 <= v <= 2:
+            raise ValueError("WO_MEMBER_KB_MAX_CONCURRENCY must be between 1 and 2")
+        return v
+
+    @field_validator("member_kb_retries")
+    @classmethod
+    def _validate_member_kb_retries(cls, v: int) -> int:
+        if not 1 <= v <= 3:
+            raise ValueError("WO_MEMBER_KB_RETRIES must be between 1 and 3")
         return v
 
     @field_validator("agent_continuation_max_followups")
