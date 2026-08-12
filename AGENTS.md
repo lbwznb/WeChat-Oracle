@@ -14,6 +14,10 @@ Discover every numeric `message_N.db` shard; keep `Name2Id` and fallback local-m
 
 `packaging/wechat-oracle.spec` produces a console-mode Windows x64 `onedir` package. Frozen child processes must launch through the current executable, and the package must include `schema.sql`, the production `wechat_oracle.raw_wechat` code, cryptography support, local OCR/VAD assets, CTranslate2/ONNX Runtime DLLs, and Textual's lazy modules. It must never bundle `.env`, `data/`, personas, logs, raw/decrypted WeChat databases or keys, or anything under `experimental/`; portable mutable state remains beside the executable. Keep wx4py's AGPL-3.0-or-later license in the output, and review redistribution obligations before publishing a binary.
 
+## Member knowledge invariant
+
+Per-member knowledge is keyed by `(canonical group_id, sender_wxid)` and never linked across groups. `messages` remains the only raw-message store; claims reference evidence message IDs that must belong to the same group/member and the exact model-input batch. Missing sender IDs go only to the per-group `__unknown__` bucket and must not personalize a named member. Manual section locks win over model output, and superseded/deleted claims remain auditable. Profile/cursor/evidence updates commit atomically; no failed or invalid model response may advance a cursor.
+
 ## 架构一句话
 
 采集进程（WeFlow SSE、wx4py 可见 UI，或用户显式授权的本机微信只读同步）与 `dispatcher` 共享一份 WAL 模式 SQLite (`data/wechat-oracle.db`)。本机原库路径必须先产生稳定、验证通过的临时快照，只把用户精确选择群的规范化 `Message` 经 `ingest/writer.py:write_messages` 写入本地记忆库。dispatcher 使用 OpenAI-compatible API 处理 @ 回复与定时摘要，再用串行、精确白名单约束的 UIA 发送器回群；首版配置界面只提供 native SQLite + OpenAI-compatible API，不依赖 Pi Agent。
@@ -116,6 +120,7 @@ uv run wechat-oracle weflow sessions --groups-only          # 列出所有 @chat
 | F15 | `WO_REPLY_BACKEND` 取值集 (`uia-direct` / `wx4py` / `stdout`) | `replier.py:build_replier` if-chain + `config.py:reply_backend` 注释 + `README.md` 配置参考表 | hook (config.py 改触发) | 加新 backend 时把这三处都同步；`uia-direct` 还必须遵守本文「No-mouse UIA reply invariant」；新建一个 `XxxReplier` 类实现 `Replier` 协议即可，不动 dispatcher。**Tencent iLink Bot 不在列表里**——实测不可群发，见 README「实验记录」 |
 | F18 | OpenClaw backend stack | `config.py:agent_backend/openclaw_*` + `llm.py:OpenClawChatCompletions/OpenClawCompletionLLM` + `agent/backend.py` + `agent/backends/openclaw.py` + `agent/orchestrator.py:chat_via_lurk` + `mcp_server.py` + `cli.py:openclaw_app` + `scripts/register_mcp.ps1` + `scripts/register_mcp.sh` + `examples/openclaw/*` + `README.md` OpenClaw setup | — | OpenClaw runs on Windows from the same checkout and normal project `.venv`. MCP tools take explicit `group_id`; keep group isolation and read-before-write memory semantics aligned with native tools. In `WO_AGENT_BACKEND=openclaw`, chat triggers, Local Ask, slash-command text/JSON completions, and lurk reflection all use the OpenClaw gateway. MCP `load_image(group_id, msg_id)` returns the raw image as a FastMCP `Image` content block so the wechat-bot agent's own vision sees pixels directly. MCP `read_image(group_id, msg_id, prompt?)` mirrors native `ReadImageTool`: it uses configured `WO_VISION_*` and returns text. |
 | F19 | 授权式微信原库读取 | `src/wechat_oracle/raw_wechat/` + `config.py` + `cli.py` + `.gitignore` + `README.md` + 本文件「本机原库边界」 | — | 默认关闭、精确账号/群授权、稳定只读副本、密钥与聊天原文不落日志/不进 Git；任何导入仍统一走 `write_messages()`。 |
+| F20 | 分群成员知识库 | `schema.sql` + `member_knowledge.py` + Agent 只读工具 + summary context + `config.py` + `README.md` + 本文件「Member knowledge invariant」 | — | 原话不复制；证据必须同群同成员；未知成员不个性化；锁定栏目不可覆盖；失败不推进游标。 |
 
 **新事实进表的判定**：如果你引入了一个事实它**注定要在两个以上文件里出现**（即使本仓库现在只放在了一处），就把它登记到本表，并尽量用单源 + import 替代多处复制。
 

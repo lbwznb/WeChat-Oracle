@@ -19,6 +19,7 @@ def _config(**changes) -> AgentRuntimeConfig:
         raw_wechat_account="0123456789ab",
         hourly_summary_enabled=True,
         daily_summary_enabled=True,
+        member_kb_enabled=True,
     )
     values.update(changes)
     return AgentRuntimeConfig(**values)
@@ -57,3 +58,38 @@ def test_native_config_does_not_require_legacy_openclaw_id(tmp_path: Path) -> No
         _config(openclaw_agent_id=""), env_path=tmp_path / ".env"
     )
     assert updates["WO_AGENT_BACKEND"] == "native"
+
+
+def test_member_kb_config_is_persisted(tmp_path: Path) -> None:
+    env = tmp_path / ".env"
+    updates = save_agent_runtime_config(
+        _config(
+            member_kb_enabled=True,
+            member_kb_interval_seconds=7200,
+            member_kb_chunk_chars=32000,
+            member_kb_max_concurrency=2,
+            member_kb_retries=3,
+        ),
+        env_path=env,
+    )
+    assert updates["WO_MEMBER_KB_ENABLED"] == "true"
+    assert updates["WO_MEMBER_KB_INTERVAL_SECONDS"] == "7200"
+    assert updates["WO_MEMBER_KB_CHUNK_CHARS"] == "32000"
+    assert updates["WO_MEMBER_KB_MAX_CONCURRENCY"] == "2"
+    assert updates["WO_MEMBER_KB_RETRIES"] == "3"
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"member_kb_interval_seconds": 299},
+        {"member_kb_chunk_chars": 3999},
+        {"member_kb_max_concurrency": 0},
+        {"member_kb_max_concurrency": 3},
+        {"member_kb_retries": 0},
+        {"member_kb_retries": 4},
+    ],
+)
+def test_member_kb_config_rejects_unsafe_bounds(tmp_path: Path, changes: dict) -> None:
+    with pytest.raises(ValueError, match="member knowledge"):
+        save_agent_runtime_config(_config(**changes), env_path=tmp_path / ".env")

@@ -128,6 +128,13 @@ WO_DAILY_SUMMARY_ENABLED=False
 WO_SUMMARY_TIMEZONE=Asia/Hong_Kong
 WO_SUMMARY_SYNC_GRACE_SECONDS=300
 
+# 带原话证据的分群成员画像。请从主界面查看历史消息数量和隐私提示后启用。
+WO_MEMBER_KB_ENABLED=False
+WO_MEMBER_KB_INTERVAL_SECONDS=3600
+WO_MEMBER_KB_CHUNK_CHARS=24000
+WO_MEMBER_KB_MAX_CONCURRENCY=2
+WO_MEMBER_KB_RETRIES=3
+
 # Optional agent tuning
 WO_AGENT_BASE_PROBABILITY=0.25
 WO_AGENT_PROACTIVE_MODE=reactive
@@ -261,6 +268,20 @@ uv run wechat-oracle agent wipe <group_id>
 uv run wechat-oracle agent wipe <group_id> --persona-only
 uv run wechat-oracle agent wipe <group_id> --memory-only -y
 ```
+
+分群成员知识库：
+
+```powershell
+uv run wechat-oracle member-kb status --group-id <group_id>
+uv run wechat-oracle member-kb bootstrap --group-id <group_id>
+uv run wechat-oracle member-kb run-once --group-id <group_id>
+uv run wechat-oracle member-kb show --group-id <group_id> --member <wxid或精确昵称>
+uv run wechat-oracle member-kb show --group-id <group_id> --member <wxid> --messages --limit 50
+uv run wechat-oracle member-kb delete --group-id <group_id> --member <wxid> --yes
+uv run wechat-oracle member-kb rebuild --group-id <group_id> --member <wxid> --yes
+```
+
+成员原始消息库直接使用现有 `messages` 表，不复制聊天记录。画像和结论严格按群隔离，保存证据消息 ID，并永久保留被新证据取代的旧结论；同一个 wxid 在不同群不会合并。主界面按 `k` 可查看成员、结论证据和原话，也可编辑或锁定画像栏目。启用后，所选群消息和派生画像会发送到配置的 OpenAI-compatible API；本安装允许敏感属性推断，并允许回复和定时总结使用这些画像。
 
 健康检查：
 
@@ -495,6 +516,9 @@ transcript 状态：
 | `group_state` | live/backfill 的群级游标。 |
 | `persona_drift` | 每群可演化的行为补充。 |
 | `group_memory` | 每群自由文本长期记忆文档。 |
+| `member_profiles` / `member_alias_history` | 按群隔离的结构化成员画像、人工锁定栏目和昵称历史。 |
+| `member_claims` / `member_claim_evidence` | 永久保留的画像结论及其来源、置信度、敏感标记、状态和原话证据 ID。 |
+| `member_update_state` / `member_update_runs` | 可恢复的逐成员更新游标和画像运行审计。 |
 | `agent_run_log` | chat、lurk 和 Local Ask 的 agent 审计轨迹。 |
 | `agent_lurk_state` | lurk 游标，独立于审计日志。 |
 | `agent_proactive_outbox` | 延迟 proactive continuation 任务；只存 intent，不存预生成回复文本。 |
@@ -543,6 +567,11 @@ transcript 状态：
 | `WO_SUMMARY_SYNC_GRACE_SECONDS` | `300` | 周期结束后等待本机数据库同步追平。 |
 | `WO_SUMMARY_GENERATION_LEASE_SECONDS` | `900` | 摘要生成崩溃恢复租约。 |
 | `WO_SUMMARY_SENDING_LEASE_SECONDS` | `300` | 发送租约过期后转 unknown，绝不自动重试。 |
+| `WO_MEMBER_KB_ENABLED` | `False` | 明确启用完整历史和每小时成员画像更新。 |
+| `WO_MEMBER_KB_INTERVAL_SECONDS` | `3600` | 成员画像调度最小间隔；整点任务仍等待同步 grace。 |
+| `WO_MEMBER_KB_CHUNK_CHARS` | `24000` | 单次成员画像模型请求的大致输入字符预算。 |
+| `WO_MEMBER_KB_MAX_CONCURRENCY` | `2` | 同时进行的逐成员模型调用上限。 |
+| `WO_MEMBER_KB_RETRIES` | `3` | 单块失败重试次数；画像、证据和游标原子提交成功后才推进。 |
 | `WO_LLM_MAX_TOKENS` | `5000` | 通用输出上限。 |
 | `WO_LLM_CHAT_MAX_TOKENS` | empty | 覆盖 chat 输出上限。 |
 | `WO_LLM_SUM_MAX_TOKENS` | empty | 覆盖 summary 输出上限。 |

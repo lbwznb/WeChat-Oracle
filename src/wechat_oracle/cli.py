@@ -44,6 +44,7 @@ verify_app = typer.Typer(no_args_is_help=True, help="Health checks for the dispa
 agent_app = typer.Typer(no_args_is_help=True, help="Inspect & manage agent memory (persona_drift / group_memory / run logs).")
 openclaw_app = typer.Typer(no_args_is_help=True, help="OpenClaw runtime backend (the recommended agent path; uses subscription instead of per-token API).")
 raw_app = typer.Typer(no_args_is_help=True, help="Authorized read-only local WeChat database synchronization.")
+member_kb_app = typer.Typer(no_args_is_help=True, help="Inspect and maintain evidence-linked per-member knowledge.")
 app.add_typer(ingest_app, name="ingest")
 app.add_typer(weflow_app, name="weflow")
 app.add_typer(worker_app, name="worker")
@@ -51,6 +52,7 @@ app.add_typer(verify_app, name="verify")
 app.add_typer(agent_app, name="agent")
 app.add_typer(openclaw_app, name="openclaw")
 app.add_typer(raw_app, name="raw")
+app.add_typer(member_kb_app, name="member-kb")
 
 
 def _run_raw_command(command: str, *args: str) -> None:
@@ -115,6 +117,240 @@ def raw_run(account: str = typer.Option("", "--account")) -> None:
 def raw_status() -> None:
     """Show sanitized local WeChat authorization and process status."""
     _run_raw_command("status")
+
+
+def _member_kb_llm():
+    from .llm import build_llm_client
+
+    return build_llm_client(
+        provider=settings.llm_provider,
+        api_key=settings.llm_api_key,
+        endpoint=settings.llm_endpoint,
+        json_mode=settings.llm_json_mode,
+    )
+
+
+def _resolve_member_selector(conn, group_id: str, selector: str) -> str:
+    from .member_knowledge import list_member_profiles
+
+    exact: list[str] = []
+    # Exact stable ids remain resolvable even after the derived profile was
+    # deleted, so `rebuild --member <wxid>` can revive it from raw history.
+    raw = conn.execute(
+        """
+        SELECT DISTINCT CASE
+            WHEN sender_wxid IS NULL OR TRIM(sender_wxid)='' THEN '__unknown__'
+            ELSE TRIM(sender_wxid) END AS member
+          FROM messages
+         WHERE group_id=?
+        """,
+        (group_id,),
+    ).fetchall()
+    exact.extend(str(row["member"]) for row in raw if selector == str(row["member"]))
+    for item in list_member_profiles(conn, group_id):
+        sender = str(item.get("sender_wxid") or "")
+        names = {
+            str(item.get("display_name") or ""),
+            str(item.get("current_display_name") or ""),
+            *(str(value) for value in (item.get("aliases") or [])),
+        }
+        if selector == sender or selector in names:
+            exact.append(sender)
+    exact = list(dict.fromkeys(value for value in exact if value))
+    if not exact:
+        raise typer.BadParameter("member selector did not match an exact member id or name")
+    if len(exact) != 1:
+        raise typer.BadParameter("member selector is ambiguous; use the exact sender wxid")
+    return exact[0]
+
+
+def _member_kb_selected_group_ids(conn) -> list[str]:
+    selectors = [str(item) for item in settings.groups if str(item).strip()]
+    if not selectors:
+        return []
+    placeholders = ",".join("?" for _ in selectors)
+    rows = conn.execute(
+        f"""
+        SELECT DISTINCT COALESCE(ga.canonical_group_id, m.group_id) AS group_id
+          FROM messages m
+          LEFT JOIN group_aliases ga ON ga.alias_id=m.group_id
+         WHERE m.group_id IN ({placeholders})
+            OR m.group_name IN ({placeholders})
+            OR EXISTS (
+                SELECT 1 FROM raw_group_authorizations rga
+                 WHERE rga.canonical_group_id=COALESCE(ga.canonical_group_id,m.group_id)
+                   AND (rga.canonical_group_id IN ({placeholders})
+                        OR rga.display_name IN ({placeholders}))
+            )
+        """,
+        selectors * 4,
+    ).fetchall()
+    group_ids = [str(row["group_id"]) for row in rows]
+    if settings.raw_wechat_enabled:
+        authorized = {
+            str(row["canonical_group_id"])
+            for row in conn.execute(
+                """
+                SELECT canonical_group_id FROM raw_group_authorizations
+                 WHERE account_fingerprint=? AND enabled=1
+                """,
+                (settings.raw_wechat_account,),
+            ).fetchall()
+        }
+        group_ids = [group for group in group_ids if group in authorized]
+    return sorted(set(group_ids))
+
+
+def _require_member_kb_selected_group(conn, group_id: str) -> None:
+    if group_id not in _member_kb_selected_group_ids(conn):
+        raise typer.BadParameter(
+            "--group-id is not in the current exact member-knowledge authorization"
+        )
+
+
+@member_kb_app.command("status")
+def member_kb_status(group_id: str = typer.Option("", "--group-id")) -> None:
+    """Show derived-profile progress without printing chat content."""
+    init_db()
+    with get_conn() as conn:
+        if group_id:
+            _require_member_kb_selected_group(conn, group_id)
+        where = "WHERE p.group_id=?" if group_id else ""
+        params = (group_id,) if group_id else ()
+        row = conn.execute(
+            f"""
+            SELECT COUNT(*) AS profiles,
+                   COALESCE(SUM(CASE WHEN s.cursor_msg_id > 0 THEN 1 ELSE 0 END), 0) AS initialized,
+                   COALESCE(MAX(p.updated_at), 0) AS last_updated
+              FROM member_profiles p
+              LEFT JOIN member_update_state s
+                ON s.group_id=p.group_id AND s.sender_wxid=p.sender_wxid
+              {where}
+            """,
+            params,
+        ).fetchone()
+    typer.echo(json.dumps(dict(row), ensure_ascii=False))
+
+
+def _run_member_kb_once(*, group_id: str, member: str) -> dict:
+    from .member_knowledge import run_due_member_updates, run_member_update
+
+    init_db()
+    with get_conn() as conn:
+        selected_groups = _member_kb_selected_group_ids(conn)
+        if group_id:
+            _require_member_kb_selected_group(conn, group_id)
+        if not group_id and not selected_groups:
+            raise typer.BadParameter(
+                "no exact groups are selected; configure a group or pass an authorized --group-id"
+            )
+        llm = _member_kb_llm()
+        if member:
+            if not group_id:
+                raise typer.BadParameter("--group-id is required with --member")
+            sender_wxid = _resolve_member_selector(conn, group_id, member)
+            return run_member_update(
+                conn,
+                group_id,
+                sender_wxid,
+                llm,
+                chunk_chars=settings.member_kb_chunk_chars,
+                retries=settings.member_kb_retries,
+            )
+        return run_due_member_updates(
+            conn,
+            llm,
+            group_ids=[group_id] if group_id else selected_groups,
+            chunk_chars=settings.member_kb_chunk_chars,
+            retries=settings.member_kb_retries,
+        )
+
+
+@member_kb_app.command("bootstrap")
+def member_kb_bootstrap(
+    group_id: str = typer.Option("", "--group-id"),
+    member: str = typer.Option("", "--member"),
+) -> None:
+    """Resume full-history profile construction from durable member cursors."""
+    typer.echo(json.dumps(_run_member_kb_once(group_id=group_id, member=member), ensure_ascii=False))
+
+
+@member_kb_app.command("run-once")
+def member_kb_run_once(
+    group_id: str = typer.Option("", "--group-id"),
+    member: str = typer.Option("", "--member"),
+) -> None:
+    """Process currently pending member messages once."""
+    typer.echo(json.dumps(_run_member_kb_once(group_id=group_id, member=member), ensure_ascii=False))
+
+
+@member_kb_app.command("show")
+def member_kb_show(
+    group_id: str = typer.Option(..., "--group-id"),
+    member: str = typer.Option(..., "--member"),
+    messages: bool = typer.Option(False, "--messages", help="Include original messages explicitly"),
+    limit: int = typer.Option(50, "--limit", min=1, max=500),
+) -> None:
+    """Show one profile; raw messages require the explicit --messages flag."""
+    from .member_knowledge import get_member_profile, list_member_messages
+
+    init_db()
+    with get_conn() as conn:
+        _require_member_kb_selected_group(conn, group_id)
+        sender_wxid = _resolve_member_selector(conn, group_id, member)
+        payload = get_member_profile(conn, group_id, sender_wxid) or {}
+        if messages:
+            payload = dict(payload)
+            payload["messages"] = list_member_messages(
+                conn, group_id, sender_wxid, limit=limit
+            )
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+
+
+@member_kb_app.command("delete")
+def member_kb_delete(
+    group_id: str = typer.Option(..., "--group-id"),
+    member: str = typer.Option(..., "--member"),
+    yes: bool = typer.Option(False, "--yes", help="Confirm derived-profile deletion"),
+) -> None:
+    """Delete derived member knowledge while retaining every raw message."""
+    from .member_knowledge import delete_member_profile
+
+    if not yes:
+        raise typer.BadParameter("pass --yes to confirm; raw messages will be retained")
+    init_db()
+    with get_conn() as conn:
+        _require_member_kb_selected_group(conn, group_id)
+        sender_wxid = _resolve_member_selector(conn, group_id, member)
+        delete_member_profile(conn, group_id, sender_wxid, keep_messages=True)
+    typer.echo("derived profile deleted; raw messages retained")
+
+
+@member_kb_app.command("rebuild")
+def member_kb_rebuild(
+    group_id: str = typer.Option(..., "--group-id"),
+    member: str = typer.Option(..., "--member"),
+    yes: bool = typer.Option(False, "--yes", help="Confirm full-history rebuild"),
+) -> None:
+    """Reset one derived profile and rebuild it from its complete message history."""
+    from .member_knowledge import reset_member_profile, run_member_update
+
+    if not yes:
+        raise typer.BadParameter("pass --yes to confirm the full-history rebuild")
+    init_db()
+    with get_conn() as conn:
+        _require_member_kb_selected_group(conn, group_id)
+        sender_wxid = _resolve_member_selector(conn, group_id, member)
+        reset_member_profile(conn, group_id, sender_wxid)
+        result = run_member_update(
+            conn,
+            group_id,
+            sender_wxid,
+            _member_kb_llm(),
+            chunk_chars=settings.member_kb_chunk_chars,
+            retries=settings.member_kb_retries,
+        )
+    typer.echo(json.dumps(result, ensure_ascii=False))
 
 
 def _configure_stdio_utf8() -> None:
@@ -246,6 +482,14 @@ def setup(
         "WO_HOURLY_SUMMARY_ENABLED": _env_bool(hourly_summary),
         "WO_DAILY_SUMMARY_ENABLED": _env_bool(daily_summary),
         "WO_SUMMARY_SYNC_GRACE_SECONDS": str(settings.summary_sync_grace_seconds),
+        # Member profiling stays off during first-run setup. Enable it later
+        # from the dashboard, where archived-message counts and the privacy
+        # warning can be shown before consent is persisted.
+        "WO_MEMBER_KB_ENABLED": "False",
+        "WO_MEMBER_KB_INTERVAL_SECONDS": str(settings.member_kb_interval_seconds),
+        "WO_MEMBER_KB_CHUNK_CHARS": str(settings.member_kb_chunk_chars),
+        "WO_MEMBER_KB_MAX_CONCURRENCY": str(settings.member_kb_max_concurrency),
+        "WO_MEMBER_KB_RETRIES": str(settings.member_kb_retries),
     }
 
     values.update(

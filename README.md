@@ -134,6 +134,14 @@ WO_DAILY_SUMMARY_ENABLED=False
 WO_SUMMARY_TIMEZONE=Asia/Hong_Kong
 WO_SUMMARY_SYNC_GRACE_SECONDS=300
 
+# Evidence-linked per-member profiles. Enable from the dashboard only after
+# reviewing the archived-message estimate and privacy warning.
+WO_MEMBER_KB_ENABLED=False
+WO_MEMBER_KB_INTERVAL_SECONDS=3600
+WO_MEMBER_KB_CHUNK_CHARS=24000
+WO_MEMBER_KB_MAX_CONCURRENCY=2
+WO_MEMBER_KB_RETRIES=3
+
 # Optional agent tuning
 WO_AGENT_BASE_PROBABILITY=0.25
 WO_AGENT_PROACTIVE_MODE=reactive
@@ -242,6 +250,20 @@ uv run wechat-oracle agent wipe <group_id>
 uv run wechat-oracle agent wipe <group_id> --persona-only
 uv run wechat-oracle agent wipe <group_id> --memory-only -y
 ```
+
+Per-group member knowledge:
+
+```powershell
+uv run wechat-oracle member-kb status --group-id <group_id>
+uv run wechat-oracle member-kb bootstrap --group-id <group_id>
+uv run wechat-oracle member-kb run-once --group-id <group_id>
+uv run wechat-oracle member-kb show --group-id <group_id> --member <wxid-or-exact-name>
+uv run wechat-oracle member-kb show --group-id <group_id> --member <wxid> --messages --limit 50
+uv run wechat-oracle member-kb delete --group-id <group_id> --member <wxid> --yes
+uv run wechat-oracle member-kb rebuild --group-id <group_id> --member <wxid> --yes
+```
+
+The raw-message library is the existing `messages` table; it is not duplicated. Profiles and claims are group-scoped, retain evidence message IDs, preserve superseded claims, and never merge the same wxid across groups. Press `k` in the dashboard to browse members, evidence, and original messages or to edit/lock profile sections. Enabling this feature sends selected group messages and derived profiles to the configured OpenAI-compatible API. In this installation, sensitive inferences are allowed in profiles and may be used by replies and scheduled summaries.
 
 Health checks:
 
@@ -512,6 +534,9 @@ Key tables:
 | `group_state` | Live/backfill per-group cursors. |
 | `persona_drift` | Per-group evolvable behavior supplement. |
 | `group_memory` | Per-group freeform long-term memory document. |
+| `member_profiles` / `member_alias_history` | Group-scoped structured member profiles, manual locks, and nickname history. |
+| `member_claims` / `member_claim_evidence` | Permanent profile claims with basis, confidence, sensitivity, status, and source message IDs. |
+| `member_update_state` / `member_update_runs` | Resumable per-member cursors and profile-update audit runs. |
 | `agent_run_log` | Agent audit traces for chat, lurk, and Local Ask turns. |
 | `agent_lurk_state` | Lurk cursor, separate from audit logs. |
 | `agent_proactive_outbox` | Delayed proactive continuation jobs. Stores intent, not pre-generated reply text. |
@@ -561,6 +586,11 @@ All runtime settings use the `WO_` prefix and can be set in `.env` or the proces
 | `WO_SUMMARY_SYNC_GRACE_SECONDS` | `300` | Wait after a period closes so local DB sync can catch up. |
 | `WO_SUMMARY_GENERATION_LEASE_SECONDS` | `900` | Crash-recovery lease for summary generation. |
 | `WO_SUMMARY_SENDING_LEASE_SECONDS` | `300` | After this sending lease expires, delivery becomes unknown and is never auto-retried. |
+| `WO_MEMBER_KB_ENABLED` | `False` | Opt in to full-history and hourly evidence-linked member profiling. |
+| `WO_MEMBER_KB_INTERVAL_SECONDS` | `3600` | Minimum member-profile scheduler interval. Mature hourly work still observes the summary sync grace. |
+| `WO_MEMBER_KB_CHUNK_CHARS` | `24000` | Approximate input-character budget for one member/profile model call. |
+| `WO_MEMBER_KB_MAX_CONCURRENCY` | `2` | Maximum concurrent per-member model calls. |
+| `WO_MEMBER_KB_RETRIES` | `3` | Retry count for a profile chunk; cursors advance only after an atomic successful write. |
 | `WO_LLM_MAX_TOKENS` | `5000` | General output cap. |
 | `WO_LLM_CHAT_MAX_TOKENS` | empty | Overrides chat cap. |
 | `WO_LLM_SUM_MAX_TOKENS` | empty | Overrides summary cap. |

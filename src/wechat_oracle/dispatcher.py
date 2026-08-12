@@ -3097,6 +3097,23 @@ def run_dispatcher() -> None:
         next_lurk_check = time.time() + max(1, settings.agent_lurk_interval_seconds)
         summary_scheduler = None
         next_summary_check = 0.0
+        member_kb_scheduler = None
+        next_member_kb_check = 0.0
+        member_kb_summary_wait_started: float | None = None
+        if settings.member_kb_enabled:
+            from .member_knowledge import MemberKnowledgeScheduler
+
+            member_kb_scheduler = MemberKnowledgeScheduler(
+                db_path=settings.db_path,
+                llm_factory=_build_llm_client,
+                settings_like=settings,
+                grace_seconds=settings.summary_sync_grace_seconds,
+                max_workers=settings.member_kb_max_concurrency,
+            )
+            logger.warning(
+                "member knowledge enabled: archived group text and derived profiles are sent to the configured model API; "
+                "sensitive inferences may be used in replies and summaries"
+            )
         if settings.hourly_summary_enabled or settings.daily_summary_enabled:
             from .daily_summary import SummaryScheduler
             summary_scheduler = SummaryScheduler(replier=replier, llm_factory=_build_llm_client)
@@ -3116,9 +3133,48 @@ def run_dispatcher() -> None:
             )
         try:
             while True:
-                if summary_scheduler is not None and time.time() >= next_summary_check:
-                    summary_scheduler.maybe_submit()
-                    next_summary_check = time.time() + 30
+                now_ts = time.time()
+                member_kb_busy = False
+                if member_kb_scheduler is not None:
+                    if now_ts >= next_member_kb_check:
+                        member_result = member_kb_scheduler.maybe_submit(now_ts)
+                        next_member_kb_check = now_ts + min(
+                            60, max(1, settings.member_kb_interval_seconds)
+                        )
+                        submitted_members = int(member_result.get("submitted", 0))
+                        if submitted_members:
+                            member_kb_summary_wait_started = now_ts
+                            logger.info(
+                                "member knowledge scheduler submitted {} member job(s)",
+                                submitted_members,
+                            )
+                        if member_result.get("errors"):
+                            logger.warning(
+                                "member knowledge scheduler reported {} sanitized error(s)",
+                                len(member_result["errors"]),
+                            )
+                    member_status = member_kb_scheduler.status()
+                    member_kb_busy = any(
+                        not bool(job.get("done"))
+                        for job in member_status.get("jobs", [])
+                    )
+                    if member_kb_busy and member_kb_summary_wait_started is None:
+                        member_kb_summary_wait_started = now_ts
+                if summary_scheduler is not None and now_ts >= next_summary_check:
+                    # Give profile jobs submitted for this boundary a bounded
+                    # head start, but never let a slow bootstrap/API block
+                    # scheduled summaries indefinitely.
+                    wait_elapsed = (
+                        now_ts - member_kb_summary_wait_started
+                        if member_kb_summary_wait_started is not None
+                        else 0
+                    )
+                    if not member_kb_busy or wait_elapsed >= 300:
+                        summary_scheduler.maybe_submit()
+                        next_summary_check = now_ts + 30
+                        member_kb_summary_wait_started = None
+                    else:
+                        next_summary_check = now_ts + 5
                 rows = _next_unprocessed(
                     conn,
                     settings.bot_name,
@@ -3171,6 +3227,8 @@ def run_dispatcher() -> None:
         finally:
             if summary_scheduler is not None:
                 summary_scheduler.close()
+            if member_kb_scheduler is not None:
+                member_kb_scheduler.close()
             scheduler.close()
             if lurk_scheduler is not None:
                 lurk_scheduler.close()
